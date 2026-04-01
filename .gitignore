@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+
+_prepared_data/
+data/
+checkpoints/
+final_checkpoint/
+location_learner/
+
+*.jsonl
+
+.wandb/
+wandb/
+**/.wandb/
+**/wandb/
+**/wandb_runtime/
