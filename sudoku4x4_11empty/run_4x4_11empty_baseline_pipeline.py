@@ -90,6 +90,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grpo_max_prompt_length", type=int, default=1024)
     p.add_argument("--grpo_max_completion_length", type=int, default=24)
     p.add_argument("--grpo_beta", type=float, default=0.0)
+    p.add_argument("--grpo_eval_solve_rate_stop", type=float, default=0.65)
+    p.add_argument("--grpo_min_steps_before_stop", type=int, default=3000)
     p.add_argument("--phase_max_wall_clock_seconds", type=int, default=21600)
     p.add_argument("--limit_train_rows", type=int, default=0)
     p.add_argument("--sft_stage_max_steps", type=str, default="")
@@ -419,6 +421,10 @@ def build_grpo_command(
             str(int(args.grpo_max_completion_length)),
             "--beta",
             str(float(args.grpo_beta)),
+            "--eval_solve_rate_stop",
+            str(float(args.grpo_eval_solve_rate_stop)),
+            "--min_steps_before_stop",
+            str(int(args.grpo_min_steps_before_stop)),
             "--max_wall_clock_seconds",
             str(int(args.phase_max_wall_clock_seconds)),
             "--wandb_group",

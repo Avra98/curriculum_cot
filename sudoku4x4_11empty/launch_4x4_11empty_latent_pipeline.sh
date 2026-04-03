@@ -40,6 +40,8 @@ cmd=(
   --grpo_per_device_train_batch_size "${GRPO_PER_DEVICE_TRAIN_BATCH_SIZE:-4}"
   --grpo_gradient_accumulation_steps "${GRPO_GRADIENT_ACCUMULATION_STEPS:-4}"
   --grpo_num_generations "${GRPO_NUM_GENERATIONS:-2}"
+  --grpo_eval_solve_rate_stop "${GRPO_EVAL_SOLVE_RATE_STOP:-0.65}"
+  --grpo_min_steps_before_stop "${GRPO_MIN_STEPS_BEFORE_STOP:-3000}"
   --sft_enable_gradient_checkpointing
   --grpo_enable_gradient_checkpointing
   --sft_save_steps "${SFT_SAVE_STEPS:-100}"

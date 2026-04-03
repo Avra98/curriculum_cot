@@ -74,6 +74,8 @@ class Args:
     penalty_malformed: float
     penalty_empty: float
     penalty_singleton: float
+    eval_solve_rate_stop: float
+    min_steps_before_stop: int
     max_wall_clock_seconds: int
     max_steps: int
     resume_from_checkpoint: str
@@ -452,6 +454,17 @@ class CustomEvalCallback(TrainerCallback):
             payload = {f"custom_eval/{k}": float(v) for k, v in metrics.items()}
             payload["custom_eval/global_step"] = float(step)
             wandb.log(payload)
+        if (
+            int(step) >= int(self.args.min_steps_before_stop)
+            and float(self.args.eval_solve_rate_stop) > 0.0
+            and float(metrics["solve_rate"]) >= float(self.args.eval_solve_rate_stop)
+        ):
+            print(
+                f"[baseline grpo custom eval step {step}] early stop: "
+                f"solve_rate={metrics['solve_rate']:.3f} >= {float(self.args.eval_solve_rate_stop):.3f}",
+                flush=True,
+            )
+            control.should_training_stop = True
         return control
 
 
@@ -530,6 +543,8 @@ def parse_args() -> Args:
     p.add_argument("--penalty_malformed", type=float, default=4.0)
     p.add_argument("--penalty_empty", type=float, default=0.5)
     p.add_argument("--penalty_singleton", type=float, default=1.5)
+    p.add_argument("--eval_solve_rate_stop", type=float, default=0.0)
+    p.add_argument("--min_steps_before_stop", type=int, default=0)
     p.add_argument("--max_wall_clock_seconds", type=int, default=0)
     p.add_argument("--max_steps", type=int, default=0)
     p.add_argument("--resume_from_checkpoint", type=str, default="")
