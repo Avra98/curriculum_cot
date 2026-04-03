@@ -27,8 +27,8 @@ DEFAULT_WANDB_GROUP = "sudoku4x4_11empty_latent_pipeline"
 DEFAULT_SFT_PROJECT = "sudoku4x4-11empty-latent-sft-residual-projector"
 DEFAULT_GRPO_PROJECT = "sudoku4x4-11empty-latent-grpo-residual-projector"
 
-SFT_SCRIPT = PARENT_DIR / "latent_multi_output_cell_policy" / "residual_projector_warmstart_sft_latent_multi_output_train.py"
-GRPO_SCRIPT = PARENT_DIR / "latent_multi_output_cell_policy" / "grpo_residual_projector_latent_train.py"
+SFT_SCRIPT = CURRENT_DIR / "residual_projector_warmstart_sft_latent_multi_output_train.py"
+GRPO_SCRIPT = CURRENT_DIR / "grpo_residual_projector_latent_train.py"
 STAGE_COMPLETE_MARKER = "_stage_complete.json"
 
 

@@ -26,8 +26,8 @@ DEFAULT_WANDB_GROUP = "sudoku4x4_11empty_baseline_pipeline"
 DEFAULT_SFT_PROJECT = "sudoku4x4-11empty-baseline-sft"
 DEFAULT_GRPO_PROJECT = "sudoku4x4-11empty-baseline-grpo"
 
-SFT_SCRIPT = PARENT_DIR / "multi_output_cell_policy" / "sft_multi_output_train.py"
-GRPO_SCRIPT = PARENT_DIR / "multi_output_cell_policy" / "grpo_multi_output_train.py"
+SFT_SCRIPT = CURRENT_DIR / "sft_multi_output_train.py"
+GRPO_SCRIPT = CURRENT_DIR / "grpo_multi_output_train.py"
 STAGE_COMPLETE_MARKER = "_stage_complete.json"
 
 
