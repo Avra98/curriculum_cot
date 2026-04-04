@@ -112,6 +112,7 @@ def build_training_examples(
 ):
     examples = []
     total_rows = len(rows)
+    eos_text = getattr(tokenizer, "eos_token", None) or ""
     for row_idx, row in enumerate(rows, start=1):
         solved = make_solved_grid_from_row(row)
         for ex in build_cell_examples_from_row(row):
@@ -128,7 +129,7 @@ def build_training_examples(
             examples.append(
                 {
                     "prompt_text": prompt,
-                    "completion_text": build_supervised_completion(ex, stage_i=stage_i),
+                    "completion_text": build_supervised_completion(ex, stage_i=stage_i) + eos_text,
                     "grid": ex.grid,
                     "solved": solved,
                     "target_cell": ex.target_cell,
@@ -149,6 +150,7 @@ def _prepared_data_dir() -> str:
 
 def _prepared_sft_cache_path(args: Args) -> str:
     payload = {
+        "completion_format_version": 2,
         "kind": "sft",
         "train_jsonl": os.path.abspath(args.train_jsonl),
         "stage_i": int(args.stage_i),

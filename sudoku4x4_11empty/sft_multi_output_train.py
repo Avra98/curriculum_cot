@@ -129,6 +129,7 @@ def build_training_examples(
     progress_callback: Any = None,
 ) -> List[Dict[str, Any]]:
     examples: List[Dict[str, Any]] = []
+    eos_text = getattr(tokenizer, "eos_token", None) or ""
     for row_idx, row in enumerate(rows, start=1):
         solved = make_solved_grid_from_row(row)
         for ex in build_cell_examples_from_row(row):
@@ -143,6 +144,8 @@ def build_training_examples(
                 total_empties_hint=total_empties_hint,
             )
             target_text = build_supervised_completion(ex, stage_i=stage_i)
+            if eos_text:
+                target_text = target_text + eos_text
             examples.append(
                 {
                     "prompt_text": prompt,
@@ -168,6 +171,7 @@ def _prepared_data_dir(args: Args) -> str:
 def _prepared_sft_cache_path(args: Args) -> str:
     payload = json.dumps(
         {
+            "completion_format_version": 2,
             "train_jsonl": os.path.abspath(args.train_jsonl),
             "stage_i": int(args.stage_i),
             "total_empties_hint": int(args.total_empties_hint),
