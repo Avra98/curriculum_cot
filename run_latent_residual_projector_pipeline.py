@@ -11,11 +11,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+CURRENT_DIR = Path(__file__).resolve().parent
+PARENT_DIR = CURRENT_DIR.parent
+if str(PARENT_DIR) not in sys.path:
+    sys.path.insert(0, str(PARENT_DIR))
+
 from checkpoint_utils import final_checkpoint_root, normalize_to_final_checkpoint_root
 
 
-CURRENT_DIR = Path(__file__).resolve().parent
-PARENT_DIR = CURRENT_DIR.parent
 DEFAULT_CHECKPOINT_ROOT = Path(final_checkpoint_root("latent_multi_output_cell_policy"))
 DEFAULT_CACHE_DIR = Path("/home/ubuntu/curriculum-CoT/.hf_cache")
 DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
@@ -487,9 +490,11 @@ def main() -> None:
     previous_grpo: Optional[Artifact] = None
     for stage in range(int(args.min_stage), int(args.max_stage) + 1):
         stage_record: Dict[str, Any] = {"stage": stage}
-        existing_sft = discover_latest_artifact(output_root, stage=stage, phase="sft", empties=int(args.total_empties_hint))
+        existing_sft = discover_latest_artifact(
+            checkpoint_root, stage=stage, phase="sft", empties=int(args.total_empties_hint)
+        )
         existing_grpo = discover_latest_artifact(
-            output_root, stage=stage, phase="grpo", empties=int(args.total_empties_hint)
+            checkpoint_root, stage=stage, phase="grpo", empties=int(args.total_empties_hint)
         )
 
         if existing_grpo is not None:

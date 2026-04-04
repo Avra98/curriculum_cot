@@ -92,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grpo_beta", type=float, default=0.0)
     p.add_argument("--grpo_eval_solve_rate_stop", type=float, default=0.65)
     p.add_argument("--grpo_min_steps_before_stop", type=int, default=3000)
+    p.add_argument("--grpo_limit_train_examples", type=int, default=0)
     p.add_argument("--phase_max_wall_clock_seconds", type=int, default=21600)
     p.add_argument("--limit_train_rows", type=int, default=0)
     p.add_argument("--sft_stage_max_steps", type=str, default="")
@@ -500,10 +501,10 @@ def main() -> None:
     for stage in range(int(args.min_stage), int(args.max_stage) + 1):
         stage_record: Dict[str, Any] = {"stage": stage}
         existing_sft = discover_latest_artifact(
-            output_root, stage=stage, phase="sft", empties=int(args.total_empties_hint)
+            checkpoint_root, stage=stage, phase="sft", empties=int(args.total_empties_hint)
         )
         existing_grpo = discover_latest_artifact(
-            output_root, stage=stage, phase="grpo", empties=int(args.total_empties_hint)
+            checkpoint_root, stage=stage, phase="grpo", empties=int(args.total_empties_hint)
         )
 
         if existing_grpo is not None:

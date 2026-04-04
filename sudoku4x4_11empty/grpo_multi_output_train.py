@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import sys
@@ -69,6 +70,7 @@ class Args:
     wandb_run_id: str
     debug_print_limit: int
     limit_train_rows: int
+    limit_train_examples: int
     reward_good_value: float
     penalty_bad_value: float
     penalty_malformed: float
@@ -172,6 +174,7 @@ def build_grpo_records(
     tokenizer: Any,
     stage_i: int,
     total_empties_hint: int,
+    max_records: int = 0,
     progress_every_rows: int = 10,
     progress_callback: Any = None,
 ) -> List[Dict[str, Any]]:
@@ -199,10 +202,14 @@ def build_grpo_records(
                     "stage_i": int(stage_i),
                 }
             )
+            if int(max_records) > 0 and len(records) >= int(max_records):
+                break
         if progress_callback is not None and (
             row_idx == 1 or row_idx == len(rows) or row_idx % max(1, int(progress_every_rows)) == 0
         ):
             progress_callback(row_idx, len(rows), len(records))
+        if int(max_records) > 0 and len(records) >= int(max_records):
+            break
     return records
 
 
@@ -219,6 +226,7 @@ def _prepared_grpo_cache_path(args: Args) -> str:
             "stage_i": int(args.stage_i),
             "total_empties_hint": int(args.total_empties_hint),
             "limit_train_rows": int(args.limit_train_rows),
+            "limit_train_examples": int(args.limit_train_examples),
             "model_name": str(args.model_name),
         },
         sort_keys=True,
@@ -272,6 +280,7 @@ def load_or_build_grpo_records(
             tokenizer=tokenizer,
             stage_i=args.stage_i,
             total_empties_hint=args.total_empties_hint,
+            max_records=int(args.limit_train_examples),
             progress_every_rows=10,
             progress_callback=progress_callback,
         )
@@ -538,6 +547,7 @@ def parse_args() -> Args:
     p.add_argument("--wandb_run_id", type=str, default="")
     p.add_argument("--debug_print_limit", type=int, default=3)
     p.add_argument("--limit_train_rows", type=int, default=0)
+    p.add_argument("--limit_train_examples", type=int, default=0)
     p.add_argument("--reward_good_value", type=float, default=1.0)
     p.add_argument("--penalty_bad_value", type=float, default=1.75)
     p.add_argument("--penalty_malformed", type=float, default=4.0)
@@ -637,6 +647,8 @@ def main() -> None:
         world_size=world_size,
         progress_callback=on_prep_progress,
     )
+    if is_main_process and int(args.limit_train_examples) > 0:
+        print(f"Limiting GRPO train records to {len(train_records)} examples", flush=True)
     if is_main_process and wb_run is not None:
         wandb.log(
             {
@@ -654,25 +666,32 @@ def main() -> None:
     ensure_trl_fsdp_compat()
     from trl import GRPOConfig, GRPOTrainer
 
-    config = GRPOConfig(
-        output_dir=args.output_dir,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        num_train_epochs=args.num_train_epochs,
-        learning_rate=args.learning_rate,
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        eval_strategy="steps",
-        eval_steps=args.eval_steps,
-        max_prompt_length=args.max_prompt_length,
-        max_completion_length=args.max_completion_length,
-        num_generations=args.num_generations,
-        beta=args.beta,
-        bf16=(pick_dtype() == torch.bfloat16),
-        report_to=["wandb"] if args.use_wandb and is_main_process else [],
-        remove_unused_columns=False,
-        max_steps=int(args.max_steps),
-    )
+    config_kwargs = {
+        "output_dir": args.output_dir,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "num_train_epochs": args.num_train_epochs,
+        "learning_rate": args.learning_rate,
+        "logging_steps": args.logging_steps,
+        "save_steps": args.save_steps,
+        "eval_strategy": "steps",
+        "eval_steps": args.eval_steps,
+        "max_prompt_length": args.max_prompt_length,
+        "max_completion_length": args.max_completion_length,
+        "num_generations": args.num_generations,
+        "beta": args.beta,
+        "bf16": (pick_dtype() == torch.bfloat16),
+        "report_to": ["wandb"] if args.use_wandb and is_main_process else [],
+        "remove_unused_columns": False,
+        "max_steps": int(args.max_steps),
+    }
+    grpo_config_params = inspect.signature(GRPOConfig.__init__).parameters
+    unsupported_keys = sorted(key for key in config_kwargs if key not in grpo_config_params)
+    for key in unsupported_keys:
+        config_kwargs.pop(key, None)
+    if is_main_process and unsupported_keys:
+        print(f"Skipping unsupported GRPOConfig args: {', '.join(unsupported_keys)}", flush=True)
+    config = GRPOConfig(**config_kwargs)
 
     trainer = GRPOTrainer(
         model=model,

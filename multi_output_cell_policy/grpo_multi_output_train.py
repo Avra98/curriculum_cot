@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import os
 import sys
@@ -74,6 +75,8 @@ class Args:
     penalty_malformed: float
     penalty_empty: float
     penalty_singleton: float
+    eval_solve_rate_stop: float
+    min_steps_before_stop: int
     max_wall_clock_seconds: int
     max_steps: int
     resume_from_checkpoint: str
@@ -443,6 +446,7 @@ class CustomEvalCallback(TrainerCallback):
         self.last_logged_step = step
         print(
             f"[baseline grpo custom eval step {step}] parse={metrics['parse_rate']:.3f} "
+            f"solve={metrics['solve_rate']:.3f} "
             f"avg_set_size={metrics['avg_predicted_set_size']:.3f} "
             f"good={metrics['avg_num_i_consistent_values']:.3f} "
             f"bad={metrics['avg_num_non_i_consistent_values']:.3f}",
@@ -452,6 +456,17 @@ class CustomEvalCallback(TrainerCallback):
             payload = {f"custom_eval/{k}": float(v) for k, v in metrics.items()}
             payload["custom_eval/global_step"] = float(step)
             wandb.log(payload)
+        if (
+            float(self.args.eval_solve_rate_stop) > 0.0
+            and step >= int(self.args.min_steps_before_stop)
+            and float(metrics["solve_rate"]) >= float(self.args.eval_solve_rate_stop)
+        ):
+            print(
+                f"[baseline grpo custom eval step {step}] stopping early: "
+                f"solve_rate={metrics['solve_rate']:.3f} >= {float(self.args.eval_solve_rate_stop):.3f}",
+                flush=True,
+            )
+            control.should_training_stop = True
         return control
 
 
@@ -530,6 +545,8 @@ def parse_args() -> Args:
     p.add_argument("--penalty_malformed", type=float, default=4.0)
     p.add_argument("--penalty_empty", type=float, default=0.5)
     p.add_argument("--penalty_singleton", type=float, default=1.5)
+    p.add_argument("--eval_solve_rate_stop", type=float, default=0.0)
+    p.add_argument("--min_steps_before_stop", type=int, default=0)
     p.add_argument("--max_wall_clock_seconds", type=int, default=0)
     p.add_argument("--max_steps", type=int, default=0)
     p.add_argument("--resume_from_checkpoint", type=str, default="")
@@ -639,25 +656,32 @@ def main() -> None:
     ensure_trl_fsdp_compat()
     from trl import GRPOConfig, GRPOTrainer
 
-    config = GRPOConfig(
-        output_dir=args.output_dir,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        num_train_epochs=args.num_train_epochs,
-        learning_rate=args.learning_rate,
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        eval_strategy="steps",
-        eval_steps=args.eval_steps,
-        max_prompt_length=args.max_prompt_length,
-        max_completion_length=args.max_completion_length,
-        num_generations=args.num_generations,
-        beta=args.beta,
-        bf16=(pick_dtype() == torch.bfloat16),
-        report_to=["wandb"] if args.use_wandb and is_main_process else [],
-        remove_unused_columns=False,
-        max_steps=int(args.max_steps),
-    )
+    config_kwargs = {
+        "output_dir": args.output_dir,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "num_train_epochs": args.num_train_epochs,
+        "learning_rate": args.learning_rate,
+        "logging_steps": args.logging_steps,
+        "save_steps": args.save_steps,
+        "eval_strategy": "steps",
+        "eval_steps": args.eval_steps,
+        "max_prompt_length": args.max_prompt_length,
+        "max_completion_length": args.max_completion_length,
+        "num_generations": args.num_generations,
+        "beta": args.beta,
+        "bf16": (pick_dtype() == torch.bfloat16),
+        "report_to": ["wandb"] if args.use_wandb and is_main_process else [],
+        "remove_unused_columns": False,
+        "max_steps": int(args.max_steps),
+    }
+    grpo_config_params = inspect.signature(GRPOConfig.__init__).parameters
+    unsupported_keys = sorted(key for key in config_kwargs if key not in grpo_config_params)
+    for key in unsupported_keys:
+        config_kwargs.pop(key, None)
+    if is_main_process and unsupported_keys:
+        print(f"Skipping unsupported GRPOConfig args: {', '.join(unsupported_keys)}", flush=True)
+    config = GRPOConfig(**config_kwargs)
 
     trainer = GRPOTrainer(
         model=model,

@@ -72,8 +72,12 @@ if [[ -n "${GRPO_STAGE_MAX_STEPS:-}" ]]; then
   cmd+=(--grpo_stage_max_steps "${GRPO_STAGE_MAX_STEPS}")
 fi
 
+if [[ "${WANDB_MODE:-offline}" != "offline" ]]; then
+  cmd+=(--use_wandb)
+fi
+
 if [[ -n "${WANDB_ENTITY:-}" ]]; then
-  cmd+=(--use_wandb --wandb_entity "${WANDB_ENTITY}")
+  cmd+=(--wandb_entity "${WANDB_ENTITY}")
 fi
 
 printf 'Launching 4x4 latent pipeline on GPUs %s\n' "${GPU_IDS}"

@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="/home/ubuntu/curriculum-CoT"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT}/.venv/bin/python}"
-TRAINER="${ROOT}/sudoku/llm_policy_icon/multi_output_cell_policy/sft_multi_output_train.py"
-TRAIN_JSONL="${TRAIN_JSONL:-${ROOT}/sudoku/llm_policy_icon/data/sudoku_t3_30empty_value_qwen_text.jsonl}"
+TRAINER="${ROOT}/multi_output_cell_policy/sft_multi_output_train.py"
+TRAIN_JSONL="${TRAIN_JSONL:-${ROOT}/data/sudoku_t3_30empty_value_qwen_text.jsonl}"
 CACHE_DIR="${CACHE_DIR:-${ROOT}/.hf_cache}"
-MODEL_NAME="${MODEL_NAME:-Qwen/Qwen2.5-7B-Instruct}"
+MODEL_NAME="${MODEL_NAME:-Qwen/Qwen2.5-0.5B-Instruct}"
 GPU_ID="${GPU_ID:-0}"
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
 NUM_PROCESSES="${NUM_PROCESSES:-1}"
 STAGE_I="${STAGE_I:-2}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${ROOT}/sudoku/llm_policy_icon/final_checkpoint/large_baseline_extension/nonlocation/sft}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${ROOT}/final_checkpoint/large_baseline_extension/hard_9x9_qwen05b/baseline/sft}"
 OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/i${STAGE_I}_${RUN_TAG}}"
 WANDB_PROJECT="${WANDB_PROJECT:-sudoku-multi-output-sft}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-large_baseline_noloc_sft_i${STAGE_I}_${RUN_TAG}}"
@@ -45,13 +46,13 @@ cmd+=(
   --stage_i "${STAGE_I}"
   --total_empties_hint "${TOTAL_EMPTIES_HINT:-30}"
   --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-4}"
-  --num_epochs "${NUM_EPOCHS:-0.75}"
-  --learning_rate "${LEARNING_RATE:-5e-5}"
+  --num_epochs "${NUM_EPOCHS:-1.0}"
+  --learning_rate "${LEARNING_RATE:-2e-4}"
   --weight_decay "${WEIGHT_DECAY:-0.0}"
   --enable_gradient_checkpointing
   --logging_steps "${LOGGING_STEPS:-10}"
-  --save_steps "${SAVE_STEPS:-50}"
-  --eval_steps "${EVAL_STEPS:-50}"
+  --save_steps "${SAVE_STEPS:-100}"
+  --eval_steps "${EVAL_STEPS:-100}"
   --eval_rows "${EVAL_ROWS:-20}"
   --max_completion_length "${MAX_COMPLETION_LENGTH:-24}"
   --wandb_project "${WANDB_PROJECT}"
@@ -63,8 +64,12 @@ if [[ -n "${INIT_ADAPTER_DIR:-}" ]]; then
   cmd+=(--init_adapter_dir "${INIT_ADAPTER_DIR}")
 fi
 
+if [[ "${WANDB_MODE:-offline}" != "offline" ]]; then
+  cmd+=(--use_wandb)
+fi
+
 if [[ -n "${WANDB_ENTITY:-}" ]]; then
-  cmd+=(--use_wandb --wandb_entity "${WANDB_ENTITY}")
+  cmd+=(--wandb_entity "${WANDB_ENTITY}")
 fi
 
 if [[ -n "${LIMIT_TRAIN_ROWS:-}" ]]; then
@@ -75,7 +80,7 @@ if [[ -n "${MAX_STEPS:-}" ]]; then
   cmd+=(--max_steps "${MAX_STEPS}")
 fi
 
-printf 'Launching baseline SFT on GPUs %s\n' "${CUDA_VISIBLE_DEVICES}"
+printf 'Launching hard 9x9 baseline SFT on GPUs %s\n' "${CUDA_VISIBLE_DEVICES}"
 printf 'Output dir: %s\n' "${OUTPUT_DIR}"
 printf 'Stage=%s processes=%s\n' "${STAGE_I}" "${NUM_PROCESSES}"
 

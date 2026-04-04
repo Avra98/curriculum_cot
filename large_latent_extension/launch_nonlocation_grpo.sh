@@ -1,29 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="/home/ubuntu/curriculum-CoT"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT}/.venv/bin/python}"
-TRAINER="${ROOT}/sudoku/llm_policy_icon/latent_multi_output_cell_policy/grpo_residual_projector_latent_train.py"
-TRAIN_JSONL="${TRAIN_JSONL:-${ROOT}/sudoku/llm_policy_icon/data/sudoku_t3_30empty_value_qwen_text.jsonl}"
+TRAINER="${ROOT}/latent_multi_output_cell_policy/grpo_residual_projector_latent_train.py"
+TRAIN_JSONL="${TRAIN_JSONL:-${ROOT}/data/sudoku_t3_30empty_value_qwen_text.jsonl}"
 CACHE_DIR="${CACHE_DIR:-${ROOT}/.hf_cache}"
-MODEL_NAME="${MODEL_NAME:-Qwen/Qwen2.5-7B-Instruct}"
+MODEL_NAME="${MODEL_NAME:-Qwen/Qwen2.5-0.5B-Instruct}"
 GPU_ID="${GPU_ID:-0}"
 GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
 NUM_PROCESSES="${NUM_PROCESSES:-1}"
 NUM_COT_TOKENS="${NUM_COT_TOKENS:?NUM_COT_TOKENS must be set}"
 STAGE_I="${STAGE_I:-2}"
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${ROOT}/sudoku/llm_policy_icon/final_checkpoint/large_latent_extension/nonlocation/grpo}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${ROOT}/final_checkpoint/large_latent_extension/hard_9x9_qwen05b/latent/grpo}"
 OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/i${STAGE_I}_cot${NUM_COT_TOKENS}_${RUN_TAG}}"
-INIT_ADAPTER_DIR="${INIT_ADAPTER_DIR:-${ROOT}/sudoku/llm_policy_icon/checkpoints/latent_multi_output_cell_policy/30_20260329_noloc_grpo_nogc_from_p0bscaa0_retry1/stage01_grpo_i1_30empty_residual_projector/checkpoint-1875}"
+INIT_ADAPTER_DIR="${INIT_ADAPTER_DIR:-}"
 WANDB_PROJECT="${WANDB_PROJECT:-sudoku-latent-multi-output-grpo-residual-projector}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-large_latent_noloc_grpo_i${STAGE_I}_cot${NUM_COT_TOKENS}_${RUN_TAG}}"
 WANDB_GROUP="${WANDB_GROUP:-large_latent_extension_noloc_grpo_i${STAGE_I}}"
 
 case "${NUM_COT_TOKENS}" in
-  2) default_bs=20; default_gas=1 ;;
-  4) default_bs=8; default_gas=2 ;;
-  5) default_bs=6; default_gas=2 ;;
+  2) default_bs=4; default_gas=2 ;;
+  4) default_bs=2; default_gas=4 ;;
+  5) default_bs=2; default_gas=4 ;;
   *) default_bs=2; default_gas=4 ;;
 esac
 
@@ -64,17 +65,20 @@ cmd+=(
   --save_steps "${SAVE_STEPS:-10}"
   --eval_steps "${EVAL_STEPS:-25}"
   --eval_rows "${EVAL_ROWS:-20}"
-  --num_generations "${NUM_GENERATIONS:-4}"
+  --num_generations "${NUM_GENERATIONS:-2}"
   --max_prompt_length "${MAX_PROMPT_LENGTH:-1024}"
   --max_completion_length "${MAX_COMPLETION_LENGTH:-32}"
   --beta "${BETA:-0.01}"
   --enable_gradient_checkpointing
-  --use_wandb
   --wandb_project "${WANDB_PROJECT}"
   --wandb_run_name "${WANDB_RUN_NAME}"
   --wandb_group "${WANDB_GROUP}"
   --wandb_mode "${WANDB_MODE:-offline}"
 )
+
+if [[ "${WANDB_MODE:-offline}" != "offline" ]]; then
+  cmd+=(--use_wandb)
+fi
 
 if [[ -n "${WANDB_ENTITY:-}" ]]; then
   cmd+=(--wandb_entity "${WANDB_ENTITY}")
@@ -88,7 +92,7 @@ if [[ -n "${RESUME_FROM_CHECKPOINT:-}" ]]; then
   cmd+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
 fi
 
-printf 'Launching non-location latent GRPO on GPUs %s\n' "${CUDA_VISIBLE_DEVICES}"
+printf 'Launching hard 9x9 latent GRPO on GPUs %s\n' "${CUDA_VISIBLE_DEVICES}"
 printf 'Output dir: %s\n' "${OUTPUT_DIR}"
 printf 'Init adapter: %s\n' "${INIT_ADAPTER_DIR}"
 printf 'num_cot_tokens=%s batch=%s grad_accum=%s stage_i=%s num_processes=%s\n' \
