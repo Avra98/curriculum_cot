@@ -673,8 +673,9 @@ def main() -> None:
         "bf16": (pick_dtype() == torch.bfloat16),
         "report_to": ["wandb"] if args.use_wandb and is_main_process else [],
         "remove_unused_columns": False,
-        "max_steps": int(args.max_steps),
     }
+    if int(args.max_steps) > 0:
+        config_kwargs["max_steps"] = int(args.max_steps)
     grpo_config_params = inspect.signature(GRPOConfig.__init__).parameters
     unsupported_keys = sorted(key for key in config_kwargs if key not in grpo_config_params)
     for key in unsupported_keys:

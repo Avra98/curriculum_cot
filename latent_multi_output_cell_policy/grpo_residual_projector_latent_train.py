@@ -1110,25 +1110,27 @@ def main() -> None:
 
     if int(args.limit_train_rows) > 0 and int(args.max_steps) <= 0:
         args.max_steps = 1
-    config = GRPOConfig(
-        output_dir=args.output_dir,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        num_train_epochs=args.num_train_epochs,
-        learning_rate=args.learning_rate,
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        eval_strategy="no",
-        do_eval=False,
-        max_completion_length=args.max_completion_length,
-        num_generations=args.num_generations,
-        beta=args.beta,
-        gradient_checkpointing=bool(args.enable_gradient_checkpointing),
-        bf16=(pick_dtype() == torch.bfloat16),
-        report_to=(["wandb"] if args.use_wandb and is_main_process else []),
-        remove_unused_columns=False,
-        max_steps=int(args.max_steps),
-    )
+    config_kwargs = {
+        "output_dir": args.output_dir,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "num_train_epochs": args.num_train_epochs,
+        "learning_rate": args.learning_rate,
+        "logging_steps": args.logging_steps,
+        "save_steps": args.save_steps,
+        "eval_strategy": "no",
+        "do_eval": False,
+        "max_completion_length": args.max_completion_length,
+        "num_generations": args.num_generations,
+        "beta": args.beta,
+        "gradient_checkpointing": bool(args.enable_gradient_checkpointing),
+        "bf16": (pick_dtype() == torch.bfloat16),
+        "report_to": (["wandb"] if args.use_wandb and is_main_process else []),
+        "remove_unused_columns": False,
+    }
+    if int(args.max_steps) > 0:
+        config_kwargs["max_steps"] = int(args.max_steps)
+    config = GRPOConfig(**config_kwargs)
 
     trainer = GRPOTrainer(
         model=model,
