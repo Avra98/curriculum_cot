@@ -27,6 +27,7 @@ if PARENT_DIR not in sys.path:
 
 from aligned_cell_policy.shared_cell_policy import build_cell_examples_from_row
 from checkpoint_utils import ensure_final_checkpoint_dir, save_checkpoint_and_update_final
+from mixed_curriculum_cot.runtime_mixed_curriculum import training_stage_i_for_row
 from multi_output_cell_policy.prompt_builder import build_multi_output_cell_prompt
 from multi_output_cell_policy.rewards import score_prediction_text
 from multi_output_cell_policy.shared_multi_output_policy import build_supervised_completion, make_solved_grid_from_row
@@ -58,9 +59,15 @@ except Exception:
 class Args:
     model_name: str
     train_jsonl: str
+    train_jsonl_stage1: str
+    train_jsonl_stage2: str
+    eval_jsonl: str
     output_dir: str
     cache_dir: str
     init_adapter_dir: str
+    lora_r: int
+    lora_alpha: int
+    lora_dropout: float
     seed: int
     gpu_id: int
     stage_i: int
@@ -83,7 +90,13 @@ class Args:
     wandb_mode: str
     debug_print_limit: int
     limit_train_rows: int
+    mixed_stage1_ratio: float
+    mixed_stage2_ratio: float
     eval_exact_set_match_stop: float
+    eval_value_precision_stop: float
+    eval_value_recall_stop: float
+    eval_solve_rate_stop: float
+    min_steps_before_stop: int
     reward_good_value: float
     penalty_bad_value: float
     penalty_malformed: float
@@ -115,11 +128,12 @@ def build_training_examples(
     eos_text = getattr(tokenizer, "eos_token", None) or ""
     for row_idx, row in enumerate(rows, start=1):
         solved = make_solved_grid_from_row(row)
+        row_stage_i = training_stage_i_for_row(row, stage_i)
         for ex in build_cell_examples_from_row(row):
             prompt = build_multi_output_cell_prompt(
                 ex.grid,
                 target_cell=ex.target_cell,
-                stage_i=stage_i,
+                stage_i=row_stage_i,
                 tokenizer=tokenizer,
                 turn_idx=ex.turn_idx,
                 total_turns=ex.total_turns,
@@ -129,10 +143,11 @@ def build_training_examples(
             examples.append(
                 {
                     "prompt_text": prompt,
-                    "completion_text": build_supervised_completion(ex, stage_i=stage_i) + eos_text,
+                    "completion_text": build_supervised_completion(ex, stage_i=row_stage_i) + eos_text,
                     "grid": ex.grid,
                     "solved": solved,
                     "target_cell": ex.target_cell,
+                    "stage_i": int(row_stage_i),
                 }
             )
         if progress_callback is not None and (
@@ -148,18 +163,27 @@ def _prepared_data_dir() -> str:
     return path
 
 
-def _prepared_sft_cache_path(args: Args) -> str:
+def _prepared_sft_cache_path(
+    *,
+    train_jsonl_path: str,
+    stage_i: int,
+    total_empties_hint: int,
+    limit_train_rows: int,
+    model_name: str,
+    dataset_tag: str,
+) -> str:
     payload = {
         "completion_format_version": 2,
         "kind": "sft",
-        "train_jsonl": os.path.abspath(args.train_jsonl),
-        "stage_i": int(args.stage_i),
-        "total_empties_hint": int(args.total_empties_hint),
-        "limit_train_rows": int(args.limit_train_rows),
-        "model_name": str(args.model_name),
+        "dataset_tag": str(dataset_tag),
+        "train_jsonl": os.path.abspath(train_jsonl_path),
+        "stage_i": int(stage_i),
+        "total_empties_hint": int(total_empties_hint),
+        "limit_train_rows": int(limit_train_rows),
+        "model_name": str(model_name),
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:20]
-    return os.path.join(_prepared_data_dir(), f"sft_stage{int(args.stage_i):02d}_{digest}.jsonl")
+    return os.path.join(_prepared_data_dir(), f"sft_stage{int(stage_i):02d}_{digest}.jsonl")
 
 
 def _write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
@@ -188,28 +212,49 @@ def _wait_for_cache(path: str, timeout_seconds: int = 6 * 60 * 60) -> None:
         time.sleep(2.0)
 
 
+def normalize_loss_weights(stage1_ratio: float, stage2_ratio: float) -> tuple[float, float]:
+    weight1 = max(0.0, float(stage1_ratio))
+    weight2 = max(0.0, float(stage2_ratio))
+    weight_sum = weight1 + weight2
+    if weight_sum <= 0.0:
+        raise ValueError("At least one mixed curriculum ratio must be positive.")
+    return (weight1 / weight_sum, weight2 / weight_sum)
+
+
 def load_or_build_sft_examples(
-    args: Args,
     *,
+    cache_train_jsonl_path: str,
+    cache_dataset_tag: str,
     rows: List[Dict[str, Any]],
     tokenizer: Any,
+    stage_i: int,
+    total_empties_hint: int,
+    limit_train_rows: int,
+    model_name: str,
     rank: int,
     world_size: int,
     progress_callback: Any = None,
 ) -> List[Dict[str, Any]]:
-    cache_path = _prepared_sft_cache_path(args)
+    cache_path = _prepared_sft_cache_path(
+        train_jsonl_path=cache_train_jsonl_path,
+        stage_i=stage_i,
+        total_empties_hint=total_empties_hint,
+        limit_train_rows=limit_train_rows,
+        model_name=model_name,
+        dataset_tag=cache_dataset_tag,
+    )
     if os.path.exists(cache_path):
         if rank == 0:
-            print(f"[dataset build][sft stage {args.stage_i}] loading prepared cache: {cache_path}", flush=True)
+            print(f"[dataset build][{cache_dataset_tag}] loading prepared cache: {cache_path}", flush=True)
         return _read_jsonl(cache_path)
 
     if rank == 0:
-        print(f"[dataset build][sft stage {args.stage_i}] building prepared cache: {cache_path}", flush=True)
+        print(f"[dataset build][{cache_dataset_tag}] building prepared cache: {cache_path}", flush=True)
         built = build_training_examples(
             rows,
             tokenizer=tokenizer,
-            stage_i=args.stage_i,
-            total_empties_hint=args.total_empties_hint,
+            stage_i=stage_i,
+            total_empties_hint=total_empties_hint,
             progress_every_rows=10,
             progress_callback=progress_callback,
         )
@@ -227,6 +272,17 @@ def load_or_build_sft_examples(
     if world_size > 1 and dist.is_initialized():
         dist.barrier()
     return _read_jsonl(cache_path)
+
+
+def load_weighted_training_row_groups(args: Args) -> tuple[float, List[Dict[str, Any]], float, List[Dict[str, Any]]]:
+    stage1_weight, stage2_weight = normalize_loss_weights(args.mixed_stage1_ratio, args.mixed_stage2_ratio)
+    stage1_rows: List[Dict[str, Any]] = []
+    stage2_rows: List[Dict[str, Any]] = []
+    if stage1_weight > 0.0:
+        stage1_rows = load_jsonl_rows(args.train_jsonl_stage1 or args.train_jsonl, limit_rows=args.limit_train_rows)
+    if stage2_weight > 0.0:
+        stage2_rows = load_jsonl_rows(args.train_jsonl_stage2 or args.train_jsonl, limit_rows=args.limit_train_rows)
+    return stage1_weight, stage1_rows, stage2_weight, stage2_rows
 
 
 def residual_next_token_logits_from_ids(
@@ -274,8 +330,11 @@ def run_eval(
     model: nn.Module,
     tokenizer: Any,
     device: torch.device,
+    eval_stage_i: int | None = None,
+    log_prefix: str = "latent sft eval",
 ) -> Dict[str, float]:
     model.eval()
+    stage_i = int(eval_stage_i if eval_stage_i is not None else args.stage_i)
     total_cells = 0
     parse_ok = 0.0
     canonical_ok = 0.0
@@ -295,7 +354,7 @@ def run_eval(
             prompt = build_multi_output_cell_prompt(
                 ex.grid,
                 target_cell=ex.target_cell,
-                stage_i=args.stage_i,
+                stage_i=stage_i,
                 tokenizer=tokenizer,
                 turn_idx=ex.turn_idx,
                 total_turns=ex.total_turns,
@@ -320,7 +379,7 @@ def run_eval(
                 grid=ex.grid,
                 solved=solved,
                 target_cell=ex.target_cell,
-                stage_i=args.stage_i,
+                stage_i=stage_i,
                 reward_good_value=args.reward_good_value,
                 penalty_bad_value=args.penalty_bad_value,
                 penalty_malformed=args.penalty_malformed,
@@ -358,11 +417,43 @@ def run_eval(
         "solve_rate": float(solve_ok / max(1, len(rows))),
     }
     print(
-        f"[latent sft eval] parse={out['parse_rate']:.3f} canonical={out['strict_canonical_rate']:.3f} "
+        f"[{log_prefix}] parse={out['parse_rate']:.3f} canonical={out['strict_canonical_rate']:.3f} "
         f"exact={out['exact_set_match_rate']:.3f} precision={out['value_precision']:.3f} "
         f"recall={out['value_recall']:.3f} solve={out['solve_rate']:.3f}"
     )
     model.train()
+    return out
+
+
+def run_dual_eval(
+    *,
+    args: Args,
+    eval_rows_stage1: List[Dict[str, Any]],
+    eval_rows_stage2: List[Dict[str, Any]],
+    model: nn.Module,
+    tokenizer: Any,
+    device: torch.device,
+) -> Dict[str, float]:
+    metrics_stage1 = run_eval(
+        args=args,
+        rows=eval_rows_stage1,
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        eval_stage_i=1,
+        log_prefix="latent sft eval stage1",
+    )
+    metrics_stage2 = run_eval(
+        args=args,
+        rows=eval_rows_stage2,
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        eval_stage_i=max(1, int(args.stage_i)),
+        log_prefix=f"latent sft eval stage{int(args.stage_i)}",
+    )
+    out = {f"stage1/{k}": float(v) for k, v in metrics_stage1.items()}
+    out.update({f"stage{int(args.stage_i)}/{k}": float(v) for k, v in metrics_stage2.items()})
     return out
 
 
@@ -384,9 +475,25 @@ def parse_args() -> Args:
         type=str,
         default="/egr/research-slim/ghoshavr/curriculum-CoT/sudoku/llm_policy_icon/data/sudoku_t3_20empty_value_qwen_text.jsonl",
     )
+    p.add_argument("--train_jsonl_stage1", type=str, default="")
+    p.add_argument("--train_jsonl_stage2", type=str, default="")
+    p.add_argument(
+        "--eval_jsonl",
+        type=str,
+        default="",
+        help="If set, first eval_rows lines used for both stage1/stage2 eval. Else slice train files.",
+    )
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--cache_dir", type=str, default="/egr/research-slim/ghoshavr/.hf_cache")
-    p.add_argument("--init_adapter_dir", type=str, required=True)
+    p.add_argument(
+        "--init_adapter_dir",
+        type=str,
+        default="",
+        help="Peft checkpoint dir, or empty for fresh LoRA on base (random).",
+    )
+    p.add_argument("--lora_r", type=int, default=32)
+    p.add_argument("--lora_alpha", type=int, default=64)
+    p.add_argument("--lora_dropout", type=float, default=0.05)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--gpu_id", type=int, default=0)
     p.add_argument("--stage_i", type=int, default=2)
@@ -409,7 +516,18 @@ def parse_args() -> Args:
     p.add_argument("--wandb_mode", type=str, default="online")
     p.add_argument("--debug_print_limit", type=int, default=3)
     p.add_argument("--limit_train_rows", type=int, default=0)
+    p.add_argument("--mixed_stage1_ratio", type=float, default=0.0)
+    p.add_argument("--mixed_stage2_ratio", type=float, default=1.0)
     p.add_argument("--eval_exact_set_match_stop", type=float, default=0.0)
+    p.add_argument(
+        "--eval_value_precision_stop",
+        type=float,
+        default=0.0,
+        help="With eval_value_recall_stop>0, stop when both hold on stage_i eval (after min_steps_before_stop).",
+    )
+    p.add_argument("--eval_value_recall_stop", type=float, default=0.0)
+    p.add_argument("--eval_solve_rate_stop", type=float, default=0.0)
+    p.add_argument("--min_steps_before_stop", type=int, default=0)
     p.add_argument("--reward_good_value", type=float, default=1.0)
     p.add_argument("--penalty_bad_value", type=float, default=1.75)
     p.add_argument("--penalty_malformed", type=float, default=4.0)
@@ -465,8 +583,19 @@ def main() -> None:
         print(f"W&B run URL: {wb_run.url}", flush=True)
         wandb.log({"prep/rows_done": 0.0, "prep/examples_built": 0.0, "prep/cache_hit": 0.0})
 
-    rows = load_jsonl_rows(args.train_jsonl, limit_rows=args.limit_train_rows)
-    eval_rows = rows[: max(1, int(args.eval_rows))]
+    stage1_weight, stage1_rows, stage2_weight, stage2_rows = load_weighted_training_row_groups(args)
+    eval_src = str(getattr(args, "eval_jsonl", "") or "").strip()
+    if eval_src:
+        _eval_slice = load_jsonl_rows(eval_src, limit_rows=0)[: max(1, int(args.eval_rows))]
+        eval_rows_stage1 = _eval_slice
+        eval_rows_stage2 = _eval_slice
+    else:
+        eval_rows_stage1 = load_jsonl_rows(args.train_jsonl_stage1 or args.train_jsonl, limit_rows=0)[
+            : max(1, int(args.eval_rows))
+        ]
+        eval_rows_stage2 = load_jsonl_rows(args.train_jsonl_stage2 or args.train_jsonl, limit_rows=0)[
+            : max(1, int(args.eval_rows))
+        ]
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir=cache_dir, use_fast=True)
     if tokenizer.pad_token_id is None:
@@ -482,14 +611,34 @@ def main() -> None:
         torch_dtype=pick_dtype(),
         low_cpu_mem_usage=True,
     )
-    model = load_trainable_adapter(base, args.init_adapter_dir)
-    projector_hidden = infer_projector_hidden_from_state(args.init_adapter_dir) or PROJECTOR_HIDDEN
+    model = load_trainable_adapter(
+        base,
+        args.init_adapter_dir,
+        lora_r=int(args.lora_r),
+        lora_alpha=int(args.lora_alpha),
+        lora_dropout=float(args.lora_dropout),
+    )
+    init_ad = str(args.init_adapter_dir).strip()
+    if init_ad:
+        projector_hidden = infer_projector_hidden_from_state(init_ad) or PROJECTOR_HIDDEN
+    else:
+        projector_hidden = PROJECTOR_HIDDEN
     attach_residual_projector_modules(
         model,
         hidden_size=int(unwrap_backbone(model).config.hidden_size),
         projector_hidden=projector_hidden,
     )
-    maybe_load_projector_state(model, args.init_adapter_dir)
+    if init_ad:
+        maybe_load_projector_state(model, init_ad)
+    if is_main_process:
+        if init_ad:
+            print(f"Init adapter: {init_ad}", flush=True)
+        else:
+            print(
+                "init_adapter_dir empty: fresh LoRA (random) + residual projector random init "
+                f"(lora_r={args.lora_r} lora_alpha={args.lora_alpha}).",
+                flush=True,
+            )
     if args.enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     if args.enable_gradient_checkpointing and hasattr(model, "enable_input_require_grads"):
@@ -502,39 +651,60 @@ def main() -> None:
     model.to(device)
     model.train()
 
-    def on_prep_progress(*, row_idx: int, total_rows: int, example_count: int) -> None:
+    def on_prep_progress(*, dataset_tag: str, row_idx: int, total_rows: int, example_count: int) -> None:
         if not is_main_process:
             return
         print(
-            f"[dataset build][sft stage {args.stage_i}] rows={row_idx}/{total_rows} examples={example_count}",
+            f"[dataset build][{dataset_tag}] rows={row_idx}/{total_rows} examples={example_count}",
             flush=True,
         )
         if wb_run is not None:
             wandb.log(
                 {
-                    "prep/rows_done": float(row_idx),
-                    "prep/rows_total": float(total_rows),
-                    "prep/examples_built": float(example_count),
+                    f"prep/{dataset_tag}_rows_done": float(row_idx),
+                    f"prep/{dataset_tag}_rows_total": float(total_rows),
+                    f"prep/{dataset_tag}_examples_built": float(example_count),
                 }
             )
 
-    train_examples = load_or_build_sft_examples(
-        args,
-        rows=rows,
+    stage1_examples = load_or_build_sft_examples(
+        cache_train_jsonl_path=args.train_jsonl_stage1 or args.train_jsonl,
+        cache_dataset_tag="sft_stage1_weighted",
+        rows=stage1_rows,
         tokenizer=tokenizer,
+        stage_i=1,
+        total_empties_hint=args.total_empties_hint,
+        limit_train_rows=args.limit_train_rows,
+        model_name=args.model_name,
         rank=rank,
         world_size=world_size,
-        progress_callback=on_prep_progress,
+        progress_callback=lambda **kwargs: on_prep_progress(dataset_tag="sft_stage1_weighted", **kwargs),
+    )
+    stage2_examples = load_or_build_sft_examples(
+        cache_train_jsonl_path=args.train_jsonl_stage2 or args.train_jsonl,
+        cache_dataset_tag=f"sft_stage{int(args.stage_i)}_weighted",
+        rows=stage2_rows,
+        tokenizer=tokenizer,
+        stage_i=int(args.stage_i),
+        total_empties_hint=args.total_empties_hint,
+        limit_train_rows=args.limit_train_rows,
+        model_name=args.model_name,
+        rank=rank,
+        world_size=world_size,
+        progress_callback=lambda **kwargs: on_prep_progress(dataset_tag=f"sft_stage{int(args.stage_i)}_weighted", **kwargs),
     )
     if is_main_process and wb_run is not None:
         wandb.log(
             {
-                "prep/cache_hit": float(os.path.exists(_prepared_sft_cache_path(args))),
-                "prep/examples_final": float(len(train_examples)),
+                "prep/stage1_weight": float(stage1_weight),
+                "prep/stage2_weight": float(stage2_weight),
+                "prep/stage1_examples_final": float(len(stage1_examples)),
+                "prep/stage2_examples_final": float(len(stage2_examples)),
             }
         )
     optimizer = AdamW((p for p in model.parameters() if p.requires_grad), lr=args.learning_rate, weight_decay=args.weight_decay)
-    total_steps = max(1, math.ceil(len(train_examples) * args.num_epochs / max(1, args.gradient_accumulation_steps)))
+    examples_per_epoch = max(len(stage1_examples) if stage1_weight > 0.0 else 0, len(stage2_examples) if stage2_weight > 0.0 else 0, 1)
+    total_steps = max(1, math.ceil(examples_per_epoch * args.num_epochs / max(1, args.gradient_accumulation_steps)))
     if int(args.max_steps) > 0:
         total_steps = min(total_steps, int(args.max_steps))
     step = 0
@@ -563,35 +733,76 @@ def main() -> None:
         dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
         return bool(int(tensor.item()) > 0)
 
-    for epoch_idx in range(max(1, int(math.ceil(args.num_epochs)))):
+    def build_epoch_order(examples: List[Dict[str, Any]], *, seed_offset: int, epoch_idx: int) -> List[int]:
+        if not examples:
+            return []
         if is_distributed:
             sampler = DistributedSampler(
-                train_examples,
+                examples,
                 num_replicas=world_size,
                 rank=rank,
                 shuffle=True,
-                seed=args.seed,
+                seed=args.seed + seed_offset,
                 drop_last=False,
             )
             sampler.set_epoch(epoch_idx)
-            order = list(iter(sampler))
-        else:
-            generator = torch.Generator()
-            generator.manual_seed(args.seed + epoch_idx)
-            order = torch.randperm(len(train_examples), generator=generator).tolist()
+            return list(iter(sampler))
+        generator = torch.Generator()
+        generator.manual_seed(args.seed + seed_offset + epoch_idx)
+        return torch.randperm(len(examples), generator=generator).tolist()
+
+    def cycle_order(order: List[int], target_len: int) -> List[int]:
+        if not order or target_len <= 0:
+            return []
+        if len(order) >= target_len:
+            return order[:target_len]
+        out: List[int] = []
+        while len(out) < target_len:
+            out.extend(order)
+        return out[:target_len]
+
+    for epoch_idx in range(max(1, int(math.ceil(args.num_epochs)))):
+        stage1_order = build_epoch_order(stage1_examples, seed_offset=1009, epoch_idx=epoch_idx)
+        stage2_order = build_epoch_order(stage2_examples, seed_offset=2003, epoch_idx=epoch_idx)
+        epoch_micro_steps = max(
+            len(stage1_order) if stage1_weight > 0.0 else 0,
+            len(stage2_order) if stage2_weight > 0.0 else 0,
+            1,
+        )
+        stage1_order = cycle_order(stage1_order, epoch_micro_steps)
+        stage2_order = cycle_order(stage2_order, epoch_micro_steps)
         optimizer.zero_grad(set_to_none=True)
         accum_count = 0
-        for idx, ex_idx in enumerate(order, start=1):
-            ex = train_examples[ex_idx]
-            loss = latent_residual_completion_ce_loss(
-                model,
-                tokenizer,
-                ex["prompt_text"],
-                ex["completion_text"],
-                device,
-                num_cot_tokens=args.num_cot_tokens,
-            ) / max(1, int(args.gradient_accumulation_steps))
-            loss.backward()
+        for micro_idx in range(epoch_micro_steps):
+            total_loss = torch.zeros((), device=device, dtype=torch.float32)
+            stage1_loss_value = float("nan")
+            stage2_loss_value = float("nan")
+            if stage1_weight > 0.0:
+                ex_stage1 = stage1_examples[stage1_order[micro_idx]]
+                stage1_loss = latent_residual_completion_ce_loss(
+                    model,
+                    tokenizer,
+                    ex_stage1["prompt_text"],
+                    ex_stage1["completion_text"],
+                    device,
+                    num_cot_tokens=args.num_cot_tokens,
+                )
+                total_loss = total_loss + (stage1_loss * stage1_weight)
+                stage1_loss_value = float(stage1_loss.detach().item())
+            if stage2_weight > 0.0:
+                ex_stage2 = stage2_examples[stage2_order[micro_idx]]
+                stage2_loss = latent_residual_completion_ce_loss(
+                    model,
+                    tokenizer,
+                    ex_stage2["prompt_text"],
+                    ex_stage2["completion_text"],
+                    device,
+                    num_cot_tokens=args.num_cot_tokens,
+                )
+                total_loss = total_loss + (stage2_loss * stage2_weight)
+                stage2_loss_value = float(stage2_loss.detach().item())
+            scaled_loss = total_loss / max(1, int(args.gradient_accumulation_steps))
+            scaled_loss.backward()
             accum_count += 1
             if accum_count >= int(args.gradient_accumulation_steps):
                 all_reduce_gradients()
@@ -600,22 +811,75 @@ def main() -> None:
                 accum_count = 0
                 step += 1
                 if step % int(args.logging_steps) == 0:
-                    loss_value = average_scalar(float(loss.item()) * args.gradient_accumulation_steps)
+                    loss_value = average_scalar(float(total_loss.detach().item()))
+                    stage1_loss_log = average_scalar(stage1_loss_value) if stage1_weight > 0.0 else 0.0
+                    stage2_loss_log = average_scalar(stage2_loss_value) if stage2_weight > 0.0 else 0.0
                     if is_main_process:
-                        print(f"[latent sft train step {step:05d}] loss={loss_value:.4f}", flush=True)
+                        print(
+                            f"[latent sft train step {step:05d}] loss={loss_value:.4f} "
+                            f"stage1_loss={stage1_loss_log:.4f} stage2_loss={stage2_loss_log:.4f} "
+                            f"stage1_w={stage1_weight:.2f} stage2_w={stage2_weight:.2f}",
+                            flush=True,
+                        )
                         if wb_run is not None:
-                            wandb.log({"train/loss": loss_value, "step": step})
+                            wandb.log(
+                                {
+                                    "train/loss": loss_value,
+                                    "train/stage1_loss": stage1_loss_log,
+                                    "train/stage2_loss": stage2_loss_log,
+                                    "train/stage1_weight": float(stage1_weight),
+                                    "train/stage2_weight": float(stage2_weight),
+                                    "step": step,
+                                }
+                            )
                 if step % int(args.eval_steps) == 0:
                     if is_distributed and dist.is_initialized():
                         dist.barrier()
                     should_stop_eval = False
                     if is_main_process:
-                        metrics = run_eval(args=args, rows=eval_rows, model=model, tokenizer=tokenizer, device=device)
+                        metrics = run_dual_eval(
+                            args=args,
+                            eval_rows_stage1=eval_rows_stage1,
+                            eval_rows_stage2=eval_rows_stage2,
+                            model=model,
+                            tokenizer=tokenizer,
+                            device=device,
+                        )
                         if wb_run is not None:
                             wandb.log({f"eval/{k}": float(v) for k, v in metrics.items()} | {"step": step})
+                        si = int(args.stage_i)
+                        pfx = f"stage{si}/"
                         if (
                             args.eval_exact_set_match_stop > 0.0
-                            and float(metrics["exact_set_match_rate"]) >= args.eval_exact_set_match_stop
+                            and float(metrics[f"{pfx}exact_set_match_rate"])
+                            >= args.eval_exact_set_match_stop
+                        ):
+                            save_checkpoint(model, tokenizer, args.output_dir, step)
+                            should_stop_eval = True
+                        if (
+                            not should_stop_eval
+                            and step >= int(args.min_steps_before_stop)
+                            and float(args.eval_value_precision_stop) > 0.0
+                            and float(args.eval_value_recall_stop) > 0.0
+                            and float(metrics[f"{pfx}value_precision"])
+                            >= float(args.eval_value_precision_stop)
+                            and float(metrics[f"{pfx}value_recall"])
+                            >= float(args.eval_value_recall_stop)
+                        ):
+                            print(
+                                f"[latent sft eval] stopping early: value_precision="
+                                f"{float(metrics[f'{pfx}value_precision']):.3f} value_recall="
+                                f"{float(metrics[f'{pfx}value_recall']):.3f}",
+                                flush=True,
+                            )
+                            save_checkpoint(model, tokenizer, args.output_dir, step)
+                            should_stop_eval = True
+                        if (
+                            not should_stop_eval
+                            and step >= int(args.min_steps_before_stop)
+                            and float(args.eval_solve_rate_stop) > 0.0
+                            and float(metrics[f"{pfx}solve_rate"])
+                            >= float(args.eval_solve_rate_stop)
                         ):
                             save_checkpoint(model, tokenizer, args.output_dir, step)
                             should_stop_eval = True

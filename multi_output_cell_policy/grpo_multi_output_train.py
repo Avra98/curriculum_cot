@@ -38,6 +38,7 @@ except Exception:
 class Args:
     model_name: str
     train_jsonl: str
+    eval_jsonl: str
     output_dir: str
     cache_dir: str
     init_adapter_dir: str
@@ -75,6 +76,8 @@ class Args:
     penalty_malformed: float
     penalty_empty: float
     penalty_singleton: float
+    eval_value_precision_stop: float
+    eval_value_recall_stop: float
     eval_solve_rate_stop: float
     min_steps_before_stop: int
     max_wall_clock_seconds: int
@@ -428,44 +431,70 @@ class CustomEvalCallback(TrainerCallback):
         self.last_logged_step = -1
 
     def on_step_end(self, args, state, control, **kwargs):
-        if not self.is_main_process:
-            return control
         step = int(state.global_step)
-        if step <= 0 or step == self.last_logged_step or step % int(self.args.eval_steps) != 0:
+        eval_every = int(self.args.eval_steps)
+        if step <= 0 or step % eval_every != 0:
             return control
-        model = kwargs.get("model")
-        if model is None:
-            return control
-        metrics = run_eval(
-            args=self.args,
-            rows=self.eval_rows,
-            model=unwrap_training_model(model),
-            tokenizer=self.tokenizer,
-            device=self.device,
-        )
-        self.last_logged_step = step
-        print(
-            f"[baseline grpo custom eval step {step}] parse={metrics['parse_rate']:.3f} "
-            f"solve={metrics['solve_rate']:.3f} "
-            f"avg_set_size={metrics['avg_predicted_set_size']:.3f} "
-            f"good={metrics['avg_num_i_consistent_values']:.3f} "
-            f"bad={metrics['avg_num_non_i_consistent_values']:.3f}",
-            flush=True,
-        )
-        if self.args.use_wandb and self.wb_run is not None:
-            payload = {f"custom_eval/{k}": float(v) for k, v in metrics.items()}
-            payload["custom_eval/global_step"] = float(step)
-            wandb.log(payload)
-        if (
-            float(self.args.eval_solve_rate_stop) > 0.0
-            and step >= int(self.args.min_steps_before_stop)
-            and float(metrics["solve_rate"]) >= float(self.args.eval_solve_rate_stop)
-        ):
-            print(
-                f"[baseline grpo custom eval step {step}] stopping early: "
-                f"solve_rate={metrics['solve_rate']:.3f} >= {float(self.args.eval_solve_rate_stop):.3f}",
-                flush=True,
-            )
+
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        use_dist = world_size > 1 and torch.distributed.is_available() and torch.distributed.is_initialized()
+        stop_tensor = torch.zeros(1, dtype=torch.int32, device=self.device)
+
+        if self.is_main_process:
+            if step != self.last_logged_step:
+                model = kwargs.get("model")
+                if model is not None:
+                    metrics = run_eval(
+                        args=self.args,
+                        rows=self.eval_rows,
+                        model=unwrap_training_model(model),
+                        tokenizer=self.tokenizer,
+                        device=self.device,
+                    )
+                    self.last_logged_step = step
+                    print(
+                        f"[baseline grpo custom eval step {step}] parse={metrics['parse_rate']:.3f} "
+                        f"solve={metrics['solve_rate']:.3f} "
+                        f"avg_set_size={metrics['avg_predicted_set_size']:.3f} "
+                        f"good={metrics['avg_num_i_consistent_values']:.3f} "
+                        f"bad={metrics['avg_num_non_i_consistent_values']:.3f}",
+                        flush=True,
+                    )
+                    if self.args.use_wandb and self.wb_run is not None:
+                        payload = {f"custom_eval/{k}": float(v) for k, v in metrics.items()}
+                        payload["custom_eval/global_step"] = float(step)
+                        wandb.log(payload)
+                    if (
+                        float(self.args.eval_value_precision_stop) > 0.0
+                        and float(self.args.eval_value_recall_stop) > 0.0
+                        and step >= int(self.args.min_steps_before_stop)
+                        and float(metrics["value_precision"]) >= float(self.args.eval_value_precision_stop)
+                        and float(metrics["value_recall"]) >= float(self.args.eval_value_recall_stop)
+                    ):
+                        print(
+                            f"[baseline grpo custom eval step {step}] stopping early: "
+                            f"value_precision={metrics['value_precision']:.3f} >= {float(self.args.eval_value_precision_stop):.3f} "
+                            f"and value_recall={metrics['value_recall']:.3f} >= {float(self.args.eval_value_recall_stop):.3f}",
+                            flush=True,
+                        )
+                        stop_tensor[0] = 1
+                    if (
+                        int(stop_tensor.item()) == 0
+                        and float(self.args.eval_solve_rate_stop) > 0.0
+                        and step >= int(self.args.min_steps_before_stop)
+                        and float(metrics["solve_rate"]) >= float(self.args.eval_solve_rate_stop)
+                    ):
+                        print(
+                            f"[baseline grpo custom eval step {step}] stopping early: "
+                            f"solve_rate={metrics['solve_rate']:.3f} >= {float(self.args.eval_solve_rate_stop):.3f}",
+                            flush=True,
+                        )
+                        stop_tensor[0] = 1
+
+        if use_dist:
+            torch.distributed.broadcast(stop_tensor, src=0)
+
+        if int(stop_tensor.item()) != 0:
             control.should_training_stop = True
         return control
 
@@ -508,6 +537,7 @@ def parse_args() -> Args:
     p = argparse.ArgumentParser()
     p.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     p.add_argument("--train_jsonl", type=str, required=True)
+    p.add_argument("--eval_jsonl", type=str, default="")
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--cache_dir", type=str, default="/home/ubuntu/curriculum-CoT/.hf_cache")
     p.add_argument("--init_adapter_dir", type=str, required=True)
@@ -545,6 +575,8 @@ def parse_args() -> Args:
     p.add_argument("--penalty_malformed", type=float, default=4.0)
     p.add_argument("--penalty_empty", type=float, default=0.5)
     p.add_argument("--penalty_singleton", type=float, default=1.5)
+    p.add_argument("--eval_value_precision_stop", type=float, default=0.0)
+    p.add_argument("--eval_value_recall_stop", type=float, default=0.0)
     p.add_argument("--eval_solve_rate_stop", type=float, default=0.0)
     p.add_argument("--min_steps_before_stop", type=int, default=0)
     p.add_argument("--max_wall_clock_seconds", type=int, default=0)
@@ -594,7 +626,8 @@ def main() -> None:
         wandb.log({"prep/rows_done": 0.0, "prep/records_built": 0.0, "prep/cache_hit": 0.0})
 
     rows = load_jsonl_rows(args.train_jsonl, limit_rows=args.limit_train_rows)
-    eval_rows = rows[: max(1, int(args.eval_rows))]
+    eval_source = args.eval_jsonl if str(args.eval_jsonl).strip() else args.train_jsonl
+    eval_rows = load_jsonl_rows(eval_source, limit_rows=max(1, int(args.eval_rows)))
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir=cache_dir, use_fast=True)
     if tokenizer.pad_token_id is None:

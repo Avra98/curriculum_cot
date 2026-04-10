@@ -29,9 +29,11 @@ from checkpoint_utils import ensure_final_checkpoint_dir, save_checkpoint_and_up
 from multi_output_cell_policy.prompt_builder import build_multi_output_cell_prompt
 from multi_output_cell_policy.rewards import score_prediction_text
 from multi_output_cell_policy.shared_multi_output_policy import (
+    batched_completion_ce_loss,
     build_supervised_completion,
     completion_ce_loss,
     make_solved_grid_from_row,
+    stage_i_consistent_values,
 )
 
 
@@ -45,6 +47,7 @@ except Exception:
 class Args:
     model_name: str
     train_jsonl: str
+    eval_jsonl: str
     output_dir: str
     cache_dir: str
     init_adapter_dir: str
@@ -57,6 +60,7 @@ class Args:
     num_epochs: float
     learning_rate: float
     weight_decay: float
+    max_grad_norm: float
     enable_gradient_checkpointing: bool
     logging_steps: int
     save_steps: int
@@ -74,8 +78,17 @@ class Args:
     debug_print_limit: int
     limit_train_rows: int
     eval_exact_set_match_stop: float
+    eval_value_precision_stop: float
+    eval_value_recall_stop: float
+    eval_solve_rate_stop: float
+    min_steps_before_stop: int
     max_wall_clock_seconds: int
     max_steps: int
+    multi_value_oversample_factor: int
+    train_target_size_min: int
+    train_target_size_max: int
+    eval_target_size_min: int
+    eval_target_size_max: int
 
 
 def configure_hf_cache(cache_dir: str) -> str:
@@ -119,6 +132,14 @@ def load_jsonl_rows(path: str, limit_rows: int = 0) -> List[Dict[str, Any]]:
     return rows
 
 
+def target_size_allowed(target_size: int, min_size: int, max_size: int) -> bool:
+    if int(min_size) > 0 and int(target_size) < int(min_size):
+        return False
+    if int(max_size) > 0 and int(target_size) > int(max_size):
+        return False
+    return True
+
+
 def build_training_examples(
     rows: List[Dict[str, Any]],
     *,
@@ -133,6 +154,13 @@ def build_training_examples(
     for row_idx, row in enumerate(rows, start=1):
         solved = make_solved_grid_from_row(row)
         for ex in build_cell_examples_from_row(row):
+            target_values = stage_i_consistent_values(ex.grid, target_cell=ex.target_cell, stage_i=stage_i)
+            if not target_size_allowed(
+                len(target_values),
+                getattr(tokenizer, "_train_target_size_min", 0),
+                getattr(tokenizer, "_train_target_size_max", 0),
+            ):
+                continue
             prompt = build_multi_output_cell_prompt(
                 ex.grid,
                 target_cell=ex.target_cell,
@@ -146,15 +174,18 @@ def build_training_examples(
             target_text = build_supervised_completion(ex, stage_i=stage_i)
             if eos_text:
                 target_text = target_text + eos_text
-            examples.append(
-                {
-                    "prompt_text": prompt,
-                    "completion_text": target_text,
-                    "grid": ex.grid,
-                    "solved": solved,
-                    "target_cell": ex.target_cell,
-                }
-            )
+            repeat_count = max(1, int(getattr(tokenizer, "_multi_value_oversample_factor", 1))) if len(target_values) > 1 else 1
+            for _ in range(repeat_count):
+                examples.append(
+                    {
+                        "prompt_text": prompt,
+                        "completion_text": target_text,
+                        "target_values": list(target_values),
+                        "grid": ex.grid,
+                        "solved": solved,
+                        "target_cell": ex.target_cell,
+                    }
+                )
         if progress_callback is not None and (
             row_idx == 1 or row_idx == len(rows) or row_idx % max(1, int(progress_every_rows)) == 0
         ):
@@ -177,6 +208,9 @@ def _prepared_sft_cache_path(args: Args) -> str:
             "total_empties_hint": int(args.total_empties_hint),
             "limit_train_rows": int(args.limit_train_rows),
             "model_name": str(args.model_name),
+            "multi_value_oversample_factor": int(args.multi_value_oversample_factor),
+            "train_target_size_min": int(args.train_target_size_min),
+            "train_target_size_max": int(args.train_target_size_max),
         },
         sort_keys=True,
     ).encode("utf-8")
@@ -262,11 +296,17 @@ def run_eval(args: Args, rows: List[Dict[str, Any]], model: torch.nn.Module, tok
     good_count_sum = 0.0
     bad_count_sum = 0.0
     solve_ok = 0
+    solve_rows = 0
     printed = 0
     for row in rows:
         solved = make_solved_grid_from_row(row)
         row_all_exact = True
+        row_has_eval_cell = False
         for ex in build_cell_examples_from_row(row):
+            target_values = stage_i_consistent_values(ex.grid, target_cell=ex.target_cell, stage_i=args.stage_i)
+            if not target_size_allowed(len(target_values), int(args.eval_target_size_min), int(args.eval_target_size_max)):
+                continue
+            row_has_eval_cell = True
             prompt = build_multi_output_cell_prompt(
                 ex.grid,
                 target_cell=ex.target_cell,
@@ -319,7 +359,9 @@ def run_eval(args: Args, rows: List[Dict[str, Any]], model: torch.nn.Module, tok
                     flush=True,
                 )
                 printed += 1
-        solve_ok += int(row_all_exact)
+        if row_has_eval_cell:
+            solve_ok += int(row_all_exact)
+            solve_rows += 1
     out = {
         "parse_rate": float(parse_ok / max(1, total_cells)),
         "strict_canonical_rate": float(canonical_ok / max(1, total_cells)),
@@ -330,7 +372,7 @@ def run_eval(args: Args, rows: List[Dict[str, Any]], model: torch.nn.Module, tok
         "avg_predicted_set_size": float(predicted_size_sum / max(1, total_cells)),
         "avg_num_i_consistent_values": float(good_count_sum / max(1, total_cells)),
         "avg_num_non_i_consistent_values": float(bad_count_sum / max(1, total_cells)),
-        "solve_rate": float(solve_ok / max(1, len(rows))),
+        "solve_rate": float(solve_ok / max(1, solve_rows)),
     }
     print(
         f"[baseline sft eval] parse={out['parse_rate']:.3f} canonical={out['strict_canonical_rate']:.3f} "
@@ -346,6 +388,7 @@ def parse_args() -> Args:
     p = argparse.ArgumentParser()
     p.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     p.add_argument("--train_jsonl", type=str, required=True)
+    p.add_argument("--eval_jsonl", type=str, default="")
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--cache_dir", type=str, default="/home/ubuntu/curriculum-CoT/.hf_cache")
     p.add_argument("--init_adapter_dir", type=str, default="")
@@ -358,6 +401,12 @@ def parse_args() -> Args:
     p.add_argument("--num_epochs", type=float, default=1.0)
     p.add_argument("--learning_rate", type=float, default=2e-4)
     p.add_argument("--weight_decay", type=float, default=0.0)
+    p.add_argument(
+        "--max_grad_norm",
+        type=float,
+        default=1.0,
+        help="Clip global grad norm before each optimizer step (0 disables).",
+    )
     p.add_argument("--enable_gradient_checkpointing", action="store_true")
     p.add_argument("--logging_steps", type=int, default=10)
     p.add_argument("--save_steps", type=int, default=100)
@@ -375,8 +424,17 @@ def parse_args() -> Args:
     p.add_argument("--debug_print_limit", type=int, default=3)
     p.add_argument("--limit_train_rows", type=int, default=0)
     p.add_argument("--eval_exact_set_match_stop", type=float, default=0.0)
+    p.add_argument("--eval_value_precision_stop", type=float, default=0.0)
+    p.add_argument("--eval_value_recall_stop", type=float, default=0.0)
+    p.add_argument("--eval_solve_rate_stop", type=float, default=0.0)
+    p.add_argument("--min_steps_before_stop", type=int, default=0)
     p.add_argument("--max_wall_clock_seconds", type=int, default=0)
     p.add_argument("--max_steps", type=int, default=0)
+    p.add_argument("--multi_value_oversample_factor", type=int, default=1)
+    p.add_argument("--train_target_size_min", type=int, default=0)
+    p.add_argument("--train_target_size_max", type=int, default=0)
+    p.add_argument("--eval_target_size_min", type=int, default=0)
+    p.add_argument("--eval_target_size_max", type=int, default=0)
     return Args(**vars(p.parse_args()))
 
 
@@ -426,10 +484,14 @@ def main() -> None:
         wandb.log({"prep/rows_done": 0.0, "prep/examples_built": 0.0, "prep/cache_hit": 0.0})
 
     rows = load_jsonl_rows(args.train_jsonl, limit_rows=args.limit_train_rows)
-    eval_rows = rows[: max(1, int(args.eval_rows))]
+    eval_source = args.eval_jsonl if str(args.eval_jsonl).strip() else args.train_jsonl
+    eval_rows = load_jsonl_rows(eval_source, limit_rows=max(1, int(args.eval_rows)))
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir=cache_dir, use_fast=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token or "<|endoftext|>"
+    tokenizer._multi_value_oversample_factor = max(1, int(args.multi_value_oversample_factor))
+    tokenizer._train_target_size_min = max(0, int(args.train_target_size_min))
+    tokenizer._train_target_size_max = max(0, int(args.train_target_size_max))
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{local_rank}" if is_distributed else f"cuda:{max(0, int(args.gpu_id))}")
     else:
@@ -458,6 +520,8 @@ def main() -> None:
         model.config.use_cache = False
     model.to(device)
     model.train()
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
 
     def on_prep_progress(rows_done: int, total_rows: int, examples_built: int) -> None:
         if is_main_process:
@@ -485,7 +549,8 @@ def main() -> None:
         )
 
     optimizer = AdamW((p for p in model.parameters() if p.requires_grad), lr=args.learning_rate, weight_decay=args.weight_decay)
-    total_steps = max(1, math.ceil(len(train_examples) * args.num_epochs / max(1, args.gradient_accumulation_steps)))
+    denom = max(1, int(args.gradient_accumulation_steps)) * max(1, int(args.per_device_train_batch_size))
+    total_steps = max(1, math.ceil(len(train_examples) * args.num_epochs / denom))
     if int(args.max_steps) > 0:
         total_steps = min(total_steps, int(args.max_steps))
     step = 0
@@ -532,25 +597,34 @@ def main() -> None:
             order = torch.randperm(len(train_examples), generator=generator).tolist()
         optimizer.zero_grad(set_to_none=True)
         accum_count = 0
-        for ex_idx in order:
-            ex = train_examples[ex_idx]
-            loss = completion_ce_loss(
+        accum_ce_sum = 0.0
+        microbatch_size = max(1, int(args.per_device_train_batch_size))
+        for batch_start in range(0, len(order), microbatch_size):
+            batch_indices = order[batch_start : batch_start + microbatch_size]
+            batch_examples = [train_examples[ex_idx] for ex_idx in batch_indices]
+            ce_full = batched_completion_ce_loss(
                 model,
                 tokenizer,
-                ex["prompt_text"],
-                ex["completion_text"],
+                [str(ex["prompt_text"]) for ex in batch_examples],
+                [str(ex["completion_text"]) for ex in batch_examples],
                 device,
-            ) / max(1, int(args.gradient_accumulation_steps))
+            )
+            loss = ce_full / max(1, int(args.gradient_accumulation_steps))
             loss.backward()
+            accum_ce_sum += float(ce_full.detach().item())
             accum_count += 1
             if accum_count >= int(args.gradient_accumulation_steps):
                 all_reduce_gradients()
+                if float(args.max_grad_norm) > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.max_grad_norm))
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 accum_count = 0
                 step += 1
+                mean_ce = accum_ce_sum / max(1, int(args.gradient_accumulation_steps))
+                accum_ce_sum = 0.0
                 if step % int(args.logging_steps) == 0:
-                    loss_value = average_scalar(float(loss.item()) * args.gradient_accumulation_steps)
+                    loss_value = average_scalar(mean_ce)
                     if is_main_process:
                         print(f"[baseline sft train step {step:05d}] loss={loss_value:.4f}", flush=True)
                         if wb_run is not None:
@@ -566,6 +640,24 @@ def main() -> None:
                         if (
                             args.eval_exact_set_match_stop > 0.0
                             and float(ev["exact_set_match_rate"]) >= args.eval_exact_set_match_stop
+                        ):
+                            save_checkpoint(model, tokenizer, args.output_dir, step)
+                            should_stop_eval = True
+                        if (
+                            not should_stop_eval
+                            and step >= int(args.min_steps_before_stop)
+                            and args.eval_value_precision_stop > 0.0
+                            and args.eval_value_recall_stop > 0.0
+                            and float(ev["value_precision"]) >= args.eval_value_precision_stop
+                            and float(ev["value_recall"]) >= args.eval_value_recall_stop
+                        ):
+                            save_checkpoint(model, tokenizer, args.output_dir, step)
+                            should_stop_eval = True
+                        if (
+                            not should_stop_eval
+                            and args.eval_solve_rate_stop > 0.0
+                            and step >= int(args.min_steps_before_stop)
+                            and float(ev["solve_rate"]) >= args.eval_solve_rate_stop
                         ):
                             save_checkpoint(model, tokenizer, args.output_dir, step)
                             should_stop_eval = True

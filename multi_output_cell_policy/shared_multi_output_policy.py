@@ -182,6 +182,36 @@ def completion_ce_loss(
     return out.loss
 
 
+def batched_completion_ce_loss(
+    model: torch.nn.Module,
+    tokenizer: Any,
+    prompt_texts: Sequence[str],
+    completion_texts: Sequence[str],
+    device: torch.device,
+) -> torch.Tensor:
+    if len(prompt_texts) != len(completion_texts):
+        raise ValueError("prompt_texts and completion_texts must have the same length")
+    if not prompt_texts:
+        raise ValueError("batched_completion_ce_loss requires at least one example")
+
+    full_texts = [str(p) + str(c) for p, c in zip(prompt_texts, completion_texts, strict=True)]
+    batch = tokenizer(full_texts, return_tensors="pt", add_special_tokens=False, padding=True)
+    prompt_batch = tokenizer(list(prompt_texts), return_tensors="pt", add_special_tokens=False, padding=True)
+
+    input_ids = batch["input_ids"].to(device)
+    attention_mask = batch["attention_mask"].to(device)
+    prompt_attention = prompt_batch["attention_mask"]
+    prompt_lengths = prompt_attention.sum(dim=1).tolist()
+
+    labels = input_ids.clone()
+    labels[attention_mask == 0] = -100
+    for row_idx, prompt_len in enumerate(prompt_lengths):
+        labels[row_idx, : int(prompt_len)] = -100
+
+    out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+    return out.loss
+
+
 def completion_logprob(
     model: torch.nn.Module,
     tokenizer: Any,

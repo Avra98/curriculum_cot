@@ -72,6 +72,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sft_save_steps", type=int, default=100)
     p.add_argument("--sft_eval_rows", type=int, default=20)
     p.add_argument("--sft_max_completion_length", type=int, default=24)
+    p.add_argument("--sft_eval_solve_rate_stop", type=float, default=0.0)
+    p.add_argument("--sft_min_steps_before_stop", type=int, default=0)
     p.add_argument("--grpo_num_train_epochs", type=float, default=0.5)
     p.add_argument("--grpo_learning_rate", type=float, default=1e-6)
     p.add_argument("--grpo_per_device_train_batch_size", type=int, default=2)
@@ -85,6 +87,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grpo_max_prompt_length", type=int, default=1024)
     p.add_argument("--grpo_max_completion_length", type=int, default=24)
     p.add_argument("--grpo_beta", type=float, default=0.0)
+    p.add_argument("--grpo_reward_good_value", type=float, default=1.0)
+    p.add_argument("--grpo_penalty_bad_value", type=float, default=1.75)
+    p.add_argument("--grpo_penalty_malformed", type=float, default=4.0)
+    p.add_argument("--grpo_penalty_empty", type=float, default=0.5)
+    p.add_argument("--grpo_penalty_singleton", type=float, default=1.5)
     p.add_argument("--grpo_eval_solve_rate_stop", type=float, default=0.0)
     p.add_argument("--grpo_min_steps_before_stop", type=int, default=0)
     p.add_argument("--phase_max_wall_clock_seconds", type=int, default=21600)
@@ -319,6 +326,10 @@ def build_sft_command(
             str(int(args.sft_eval_rows)),
             "--max_completion_length",
             str(int(args.sft_max_completion_length)),
+            "--eval_solve_rate_stop",
+            str(float(args.sft_eval_solve_rate_stop)),
+            "--min_steps_before_stop",
+            str(int(args.sft_min_steps_before_stop)),
             "--max_wall_clock_seconds",
             str(int(args.phase_max_wall_clock_seconds)),
         ]
@@ -414,6 +425,16 @@ def build_grpo_command(
             str(int(args.grpo_max_completion_length)),
             "--beta",
             str(float(args.grpo_beta)),
+            "--reward_good_value",
+            str(float(args.grpo_reward_good_value)),
+            "--penalty_bad_value",
+            str(float(args.grpo_penalty_bad_value)),
+            "--penalty_malformed",
+            str(float(args.grpo_penalty_malformed)),
+            "--penalty_empty",
+            str(float(args.grpo_penalty_empty)),
+            "--penalty_singleton",
+            str(float(args.grpo_penalty_singleton)),
             "--eval_solve_rate_stop",
             str(float(args.grpo_eval_solve_rate_stop)),
             "--min_steps_before_stop",

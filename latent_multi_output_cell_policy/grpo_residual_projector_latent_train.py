@@ -26,6 +26,7 @@ if PARENT_DIR not in sys.path:
 
 from aligned_cell_policy.shared_cell_policy import build_cell_examples_from_row
 from checkpoint_utils import ensure_final_checkpoint_dir, save_model_artifacts
+from mixed_curriculum_cot.runtime_mixed_curriculum import build_two_stage_mixed_rows, training_stage_i_for_row
 from multi_output_cell_policy.prompt_builder import build_multi_output_cell_prompt
 from multi_output_cell_policy.rewards import score_prediction_text
 from multi_output_cell_policy.shared_multi_output_policy import make_solved_grid_from_row
@@ -44,6 +45,9 @@ PROJECTOR_HIDDEN = 4096
 class Args:
     model_name: str
     train_jsonl: str
+    train_jsonl_stage1: str
+    train_jsonl_stage2: str
+    eval_jsonl: str
     output_dir: str
     cache_dir: str
     init_adapter_dir: str
@@ -77,6 +81,8 @@ class Args:
     wandb_run_id: str
     debug_print_limit: int
     limit_train_rows: int
+    mixed_stage1_ratio: float
+    mixed_stage2_ratio: float
     reward_good_value: float
     penalty_bad_value: float
     penalty_malformed: float
@@ -85,6 +91,10 @@ class Args:
     max_wall_clock_seconds: int
     max_steps: int
     resume_from_checkpoint: str
+    eval_value_precision_stop: float
+    eval_value_recall_stop: float
+    eval_solve_rate_stop: float
+    min_steps_before_stop: int
 
 
 def configure_hf_cache(cache_dir: str) -> str:
@@ -201,11 +211,12 @@ def build_grpo_dataset(
     total_rows = len(rows)
     for row_idx, row in enumerate(rows, start=1):
         solved = make_solved_grid_from_row(row)
+        row_stage_i = training_stage_i_for_row(row, stage_i)
         for ex in build_cell_examples_from_row(row):
             prompt = build_multi_output_cell_prompt(
                 ex.grid,
                 target_cell=ex.target_cell,
-                stage_i=stage_i,
+                stage_i=row_stage_i,
                 tokenizer=tokenizer,
                 turn_idx=ex.turn_idx,
                 total_turns=ex.total_turns,
@@ -219,7 +230,7 @@ def build_grpo_dataset(
                     "solved_json": json.dumps(solved.tolist()),
                     "target_row": int(ex.target_cell[0]),
                     "target_col": int(ex.target_cell[1]),
-                    "stage_i": int(stage_i),
+                    "stage_i": int(row_stage_i),
                 }
             )
         if progress_callback is not None and (
@@ -239,9 +250,13 @@ def _prepared_grpo_cache_path(args: Args) -> str:
     payload = {
         "kind": "grpo",
         "train_jsonl": os.path.abspath(args.train_jsonl),
+        "train_jsonl_stage1": os.path.abspath(args.train_jsonl_stage1 or args.train_jsonl),
+        "train_jsonl_stage2": os.path.abspath(args.train_jsonl_stage2 or args.train_jsonl),
         "stage_i": int(args.stage_i),
         "total_empties_hint": int(args.total_empties_hint),
         "limit_train_rows": int(args.limit_train_rows),
+        "mixed_stage1_ratio": float(args.mixed_stage1_ratio),
+        "mixed_stage2_ratio": float(args.mixed_stage2_ratio),
         "model_name": str(args.model_name),
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:20]
@@ -303,6 +318,26 @@ def load_or_build_grpo_records(
     elif world_size > 1:
         _wait_for_cache(cache_path)
     return _read_jsonl(cache_path)
+
+
+def load_training_rows(args: Args) -> List[Dict[str, Any]]:
+    stage1_path = str(args.train_jsonl_stage1 or "").strip()
+    stage2_path = str(args.train_jsonl_stage2 or "").strip()
+    use_mixed = bool(stage1_path or stage2_path)
+    if not use_mixed:
+        return load_jsonl_rows(args.train_jsonl, limit_rows=args.limit_train_rows)
+
+    stage1_rows = load_jsonl_rows(stage1_path or args.train_jsonl, limit_rows=0)
+    stage2_rows = load_jsonl_rows(stage2_path or args.train_jsonl, limit_rows=0)
+    return build_two_stage_mixed_rows(
+        stage1_rows,
+        stage2_rows,
+        stage1_ratio=float(args.mixed_stage1_ratio),
+        stage2_ratio=float(args.mixed_stage2_ratio),
+        seed=int(args.seed),
+        target_stage=int(args.stage_i),
+        total_rows=int(args.limit_train_rows),
+    )
 
 
 def make_reward_func(args: Args):
@@ -755,8 +790,11 @@ def run_eval(
     model: torch.nn.Module,
     tokenizer: Any,
     device: torch.device,
+    eval_stage_i: int | None = None,
+    log_prefix: str = "latent grpo eval",
 ) -> Dict[str, float]:
     model.eval()
+    stage_i = int(eval_stage_i if eval_stage_i is not None else args.stage_i)
     total_cells = 0
     parse_ok = 0.0
     canonical_ok = 0.0
@@ -776,7 +814,7 @@ def run_eval(
             prompt = build_multi_output_cell_prompt(
                 ex.grid,
                 target_cell=ex.target_cell,
-                stage_i=args.stage_i,
+                stage_i=stage_i,
                 tokenizer=tokenizer,
                 turn_idx=ex.turn_idx,
                 total_turns=ex.total_turns,
@@ -801,7 +839,7 @@ def run_eval(
                 grid=ex.grid,
                 solved=solved,
                 target_cell=ex.target_cell,
-                stage_i=args.stage_i,
+                stage_i=stage_i,
                 reward_good_value=args.reward_good_value,
                 penalty_bad_value=args.penalty_bad_value,
                 penalty_malformed=args.penalty_malformed,
@@ -826,7 +864,7 @@ def run_eval(
                 print(f"[latent grpo eval debug] target_values={info['target_values']} predicted_values={info['predicted_values']}")
                 printed += 1
         solve_ok += int(row_all_exact)
-    return {
+    out = {
         "parse_rate": float(parse_ok / max(1, total_cells)),
         "strict_canonical_rate": float(canonical_ok / max(1, total_cells)),
         "exact_set_match_rate": float(exact_set_match / max(1, total_cells)),
@@ -839,20 +877,63 @@ def run_eval(
         "solve_rate": float(solve_ok / max(1, len(rows))),
         "eval_cells": float(total_cells),
     }
+    print(
+        f"[{log_prefix}] parse={out['parse_rate']:.3f} "
+        f"exact={out['exact_set_match_rate']:.3f} precision={out['value_precision']:.3f} "
+        f"recall={out['value_recall']:.3f} solve={out['solve_rate']:.3f} "
+        f"avg_set_size={out['avg_predicted_set_size']:.3f} "
+        f"good={out['avg_num_i_consistent_values']:.3f} "
+        f"bad={out['avg_num_non_i_consistent_values']:.3f}"
+    )
+    return out
+
+
+def run_dual_eval(
+    *,
+    args: Args,
+    eval_rows_stage1: List[Dict[str, Any]],
+    eval_rows_stage2: List[Dict[str, Any]],
+    model: torch.nn.Module,
+    tokenizer: Any,
+    device: torch.device,
+) -> Dict[str, float]:
+    metrics_stage1 = run_eval(
+        args=args,
+        rows=eval_rows_stage1,
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        eval_stage_i=1,
+        log_prefix="latent grpo eval stage1",
+    )
+    metrics_stage2 = run_eval(
+        args=args,
+        rows=eval_rows_stage2,
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        eval_stage_i=max(1, int(args.stage_i)),
+        log_prefix=f"latent grpo eval stage{int(args.stage_i)}",
+    )
+    out = {f"stage1/{k}": float(v) for k, v in metrics_stage1.items()}
+    out.update({f"stage{int(args.stage_i)}/{k}": float(v) for k, v in metrics_stage2.items()})
+    return out
 
 
 class ResidualProjectorEvalCallback(TrainerCallback):
     def __init__(
         self,
         args: Args,
-        eval_rows: List[Dict[str, Any]],
+        eval_rows_stage1: List[Dict[str, Any]],
+        eval_rows_stage2: List[Dict[str, Any]],
         tokenizer: Any,
         device: torch.device,
         wb_run: Any,
         is_main_process: bool,
     ):
         self.args = args
-        self.eval_rows = eval_rows
+        self.eval_rows_stage1 = eval_rows_stage1
+        self.eval_rows_stage2 = eval_rows_stage2
         self.tokenizer = tokenizer
         self.device = device
         self.wb_run = wb_run
@@ -861,38 +942,97 @@ class ResidualProjectorEvalCallback(TrainerCallback):
 
     def on_step_end(self, args, state, control, **kwargs):
         step = int(state.global_step)
-        if (
-            not self.is_main_process
-            or step <= 0
-            or step == self.last_logged_step
-            or step % int(self.args.eval_steps) != 0
-        ):
+        eval_every = int(self.args.eval_steps)
+        if step <= 0 or step % eval_every != 0:
             return control
-        model = kwargs.get("model")
-        if model is None:
-            return control
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        metrics = run_eval(
-            args=self.args,
-            rows=self.eval_rows,
-            model=unwrap_training_model(model),
-            tokenizer=self.tokenizer,
-            device=self.device,
-        )
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        self.last_logged_step = step
-        print(
-            f"[latent grpo custom eval step {step}] parse={metrics['parse_rate']:.3f} "
-            f"avg_set_size={metrics['avg_predicted_set_size']:.3f} "
-            f"good={metrics['avg_num_i_consistent_values']:.3f} "
-            f"bad={metrics['avg_num_non_i_consistent_values']:.3f}"
-        )
-        if self.args.use_wandb and self.wb_run is not None:
-            payload = {f"custom_eval/{k}": float(v) for k, v in metrics.items()}
-            payload["custom_eval/global_step"] = float(step)
-            wandb.log(payload)
+
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        use_dist = world_size > 1 and torch.distributed.is_available() and torch.distributed.is_initialized()
+        stop_tensor = torch.zeros(1, dtype=torch.int32, device=self.device)
+
+        if self.is_main_process:
+            if step != self.last_logged_step:
+                model = kwargs.get("model")
+                if model is not None:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    metrics = run_eval(
+                        args=self.args,
+                        rows=self.eval_rows_stage2,
+                        model=unwrap_training_model(model),
+                        tokenizer=self.tokenizer,
+                        device=self.device,
+                        eval_stage_i=max(1, int(self.args.stage_i)),
+                        log_prefix=f"latent grpo callback eval stage{int(self.args.stage_i)}",
+                    )
+                    if self.eval_rows_stage1:
+                        stage1_metrics = run_eval(
+                            args=self.args,
+                            rows=self.eval_rows_stage1,
+                            model=unwrap_training_model(model),
+                            tokenizer=self.tokenizer,
+                            device=self.device,
+                            eval_stage_i=1,
+                            log_prefix="latent grpo callback eval stage1",
+                        )
+                        metrics = {f"stage1/{k}": float(v) for k, v in stage1_metrics.items()} | {
+                            f"stage{int(self.args.stage_i)}/{k}": float(v) for k, v in metrics.items()
+                        }
+                    else:
+                        metrics = {f"stage{int(self.args.stage_i)}/{k}": float(v) for k, v in metrics.items()}
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    self.last_logged_step = step
+                    si = int(self.args.stage_i)
+                    pfx = f"stage{si}/"
+                    print(
+                        f"[latent grpo custom eval step {step}] "
+                        f"stage1_exact={metrics.get('stage1/exact_set_match_rate', float('nan')):.3f} "
+                        f"stage{si}_exact={metrics[f'{pfx}exact_set_match_rate']:.3f} "
+                        f"stage{si}_prec={metrics[f'{pfx}value_precision']:.3f} "
+                        f"stage{si}_rec={metrics[f'{pfx}value_recall']:.3f} "
+                        f"stage{si}_solve={metrics[f'{pfx}solve_rate']:.3f}",
+                        flush=True,
+                    )
+                    if self.args.use_wandb and self.wb_run is not None:
+                        payload = {f"custom_eval/{k}": float(v) for k, v in metrics.items()}
+                        payload["custom_eval/global_step"] = float(step)
+                        wandb.log(payload)
+
+                    if step >= int(self.args.min_steps_before_stop):
+                        vp = float(metrics[f"{pfx}value_precision"])
+                        vr = float(metrics[f"{pfx}value_recall"])
+                        sr = float(metrics[f"{pfx}solve_rate"])
+                        if (
+                            float(self.args.eval_value_precision_stop) > 0.0
+                            and float(self.args.eval_value_recall_stop) > 0.0
+                            and vp >= float(self.args.eval_value_precision_stop)
+                            and vr >= float(self.args.eval_value_recall_stop)
+                        ):
+                            print(
+                                f"[latent grpo custom eval step {step}] stopping early: "
+                                f"value_precision={vp:.3f} >= {float(self.args.eval_value_precision_stop):.3f} "
+                                f"and value_recall={vr:.3f} >= {float(self.args.eval_value_recall_stop):.3f}",
+                                flush=True,
+                            )
+                            stop_tensor[0] = 1
+                        if (
+                            int(stop_tensor.item()) == 0
+                            and float(self.args.eval_solve_rate_stop) > 0.0
+                            and sr >= float(self.args.eval_solve_rate_stop)
+                        ):
+                            print(
+                                f"[latent grpo custom eval step {step}] stopping early: "
+                                f"solve_rate={sr:.3f} >= {float(self.args.eval_solve_rate_stop):.3f}",
+                                flush=True,
+                            )
+                            stop_tensor[0] = 1
+
+        if use_dist:
+            torch.distributed.broadcast(stop_tensor, src=0)
+
+        if int(stop_tensor.item()) != 0:
+            control.should_training_stop = True
         return control
 
 
@@ -962,9 +1102,22 @@ def parse_args() -> Args:
         type=str,
         default="/egr/research-slim/ghoshavr/curriculum-CoT/sudoku/llm_policy_icon/data/sudoku_t3_20empty_value_qwen_text.jsonl",
     )
+    p.add_argument("--train_jsonl_stage1", type=str, default="")
+    p.add_argument("--train_jsonl_stage2", type=str, default="")
+    p.add_argument(
+        "--eval_jsonl",
+        type=str,
+        default="",
+        help="If set, first eval_rows lines are used for both stage1/stage2 eval (held-out). Else slice train files.",
+    )
     p.add_argument("--output_dir", type=str, required=True)
     p.add_argument("--cache_dir", type=str, default="/egr/research-slim/ghoshavr/.hf_cache")
-    p.add_argument("--init_adapter_dir", type=str, required=True)
+    p.add_argument(
+        "--init_adapter_dir",
+        type=str,
+        default="",
+        help="Peft adapter checkpoint dir, or empty string for fresh LoRA on the base model (random init).",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--gpu_id", type=int, default=0)
     p.add_argument("--stage_i", type=int, default=1)
@@ -995,6 +1148,8 @@ def parse_args() -> Args:
     p.add_argument("--wandb_run_id", type=str, default="")
     p.add_argument("--debug_print_limit", type=int, default=3)
     p.add_argument("--limit_train_rows", type=int, default=0)
+    p.add_argument("--mixed_stage1_ratio", type=float, default=0.0)
+    p.add_argument("--mixed_stage2_ratio", type=float, default=1.0)
     p.add_argument("--reward_good_value", type=float, default=1.0)
     p.add_argument("--penalty_bad_value", type=float, default=1.75)
     p.add_argument("--penalty_malformed", type=float, default=4.0)
@@ -1003,6 +1158,20 @@ def parse_args() -> Args:
     p.add_argument("--max_wall_clock_seconds", type=int, default=0)
     p.add_argument("--max_steps", type=int, default=0)
     p.add_argument("--resume_from_checkpoint", type=str, default="")
+    p.add_argument(
+        "--eval_value_precision_stop",
+        type=float,
+        default=0.0,
+        help="If >0 and --eval_value_recall_stop>0, stop when both reached on current stage_i eval (with min_steps_before_stop).",
+    )
+    p.add_argument("--eval_value_recall_stop", type=float, default=0.0)
+    p.add_argument(
+        "--eval_solve_rate_stop",
+        type=float,
+        default=0.0,
+        help="If >0, stop when stage_i solve_rate reaches this threshold (after min_steps_before_stop).",
+    )
+    p.add_argument("--min_steps_before_stop", type=int, default=0)
     return Args(**vars(p.parse_args()))
 
 
@@ -1042,8 +1211,19 @@ def main() -> None:
         print(f"W&B run URL: {wb_run.url}", flush=True)
         wandb.log({"prep/rows_done": 0.0, "prep/records_built": 0.0, "prep/cache_hit": 0.0})
 
-    rows = load_jsonl_rows(args.train_jsonl, limit_rows=args.limit_train_rows)
-    eval_rows = rows[: max(1, int(args.eval_rows))]
+    rows = load_training_rows(args)
+    eval_src = str(getattr(args, "eval_jsonl", "") or "").strip()
+    if eval_src:
+        _eval_slice = load_jsonl_rows(eval_src, limit_rows=0)[: max(1, int(args.eval_rows))]
+        eval_rows_stage1 = _eval_slice
+        eval_rows_stage2 = _eval_slice
+    else:
+        eval_rows_stage1 = load_jsonl_rows(args.train_jsonl_stage1 or args.train_jsonl, limit_rows=0)[
+            : max(1, int(args.eval_rows))
+        ]
+        eval_rows_stage2 = load_jsonl_rows(args.train_jsonl_stage2 or args.train_jsonl, limit_rows=0)[
+            : max(1, int(args.eval_rows))
+        ]
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir=cache_dir, use_fast=True)
     if tokenizer.pad_token_id is None:
@@ -1057,16 +1237,35 @@ def main() -> None:
         torch_dtype=pick_dtype(),
         low_cpu_mem_usage=True,
     )
-    model = load_trainable_adapter(base, args.init_adapter_dir)
-    print(f"Loaded init adapter: {args.init_adapter_dir}")
-    projector_hidden = infer_projector_hidden_from_state(args.init_adapter_dir) or PROJECTOR_HIDDEN
+    model = load_trainable_adapter(
+        base,
+        args.init_adapter_dir,
+        lora_r=int(args.lora_r),
+        lora_alpha=int(args.lora_alpha),
+        lora_dropout=float(args.lora_dropout),
+    )
+    init_ad = str(args.init_adapter_dir).strip()
+    if init_ad:
+        print(f"Loaded init adapter: {init_ad}", flush=True)
+        projector_hidden = infer_projector_hidden_from_state(init_ad) or PROJECTOR_HIDDEN
+    else:
+        print(
+            "init_adapter_dir empty: fresh LoRA on base (weights random); matches --lora_r/--lora_alpha/--lora_dropout.",
+            flush=True,
+        )
+        projector_hidden = PROJECTOR_HIDDEN
     attach_residual_projector_modules(
         model,
         hidden_size=int(unwrap_backbone(model).config.hidden_size),
         projector_hidden=projector_hidden,
     )
-    maybe_load_projector_state(model, args.init_adapter_dir)
-    print(f"Loaded latent/projector state from: {args.init_adapter_dir}")
+    if init_ad:
+        if maybe_load_projector_state(model, init_ad):
+            print(f"Loaded latent_cot_state.pt from: {init_ad}", flush=True)
+        else:
+            print(f"No latent_cot_state.pt under {init_ad}; residual projector kept at random init.", flush=True)
+    else:
+        print("Residual projector + special_thought_embed: random init (latent structure attached).", flush=True)
     if world_size <= 1:
         model.to(device)
     model.train()
@@ -1139,7 +1338,17 @@ def main() -> None:
         args=config,
         train_dataset=train_dataset,
     )
-    trainer.add_callback(ResidualProjectorEvalCallback(args, eval_rows, tokenizer, device, wb_run, is_main_process))
+    trainer.add_callback(
+        ResidualProjectorEvalCallback(
+            args,
+            eval_rows_stage1,
+            eval_rows_stage2,
+            tokenizer,
+            device,
+            wb_run,
+            is_main_process,
+        )
+    )
     trainer.add_callback(SaveLatentStateCallback(is_main_process))
     trainer.add_callback(FinalCheckpointCallback(args.output_dir, tokenizer, is_main_process))
     trainer.add_callback(WallClockStopCallback(args.max_wall_clock_seconds))
@@ -1150,13 +1359,22 @@ def main() -> None:
     final_model = trainer.accelerator.unwrap_model(trainer.model) if hasattr(trainer, "accelerator") else trainer.model
     final_model = unwrap_training_model(final_model)
     if is_main_process:
-        eval_metrics = run_eval(args=args, rows=eval_rows, model=final_model, tokenizer=tokenizer, device=device)
+        eval_metrics = run_dual_eval(
+            args=args,
+            eval_rows_stage1=eval_rows_stage1,
+            eval_rows_stage2=eval_rows_stage2,
+            model=final_model,
+            tokenizer=tokenizer,
+            device=device,
+        )
+        si = int(args.stage_i)
         print(
-            f"[latent grpo final eval] parse={eval_metrics['parse_rate']:.3f} "
-            f"canonical={eval_metrics['strict_canonical_rate']:.3f} "
-            f"exact={eval_metrics['exact_set_match_rate']:.3f} "
-            f"precision={eval_metrics['value_precision']:.3f} "
-            f"recall={eval_metrics['value_recall']:.3f} solve={eval_metrics['solve_rate']:.3f}"
+            f"[latent grpo final eval] "
+            f"stage1_exact={eval_metrics.get('stage1/exact_set_match_rate', float('nan')):.3f} "
+            f"stage{si}_exact={eval_metrics[f'stage{si}/exact_set_match_rate']:.3f} "
+            f"stage{si}_prec={eval_metrics[f'stage{si}/value_precision']:.3f} "
+            f"stage{si}_rec={eval_metrics[f'stage{si}/value_recall']:.3f} "
+            f"stage{si}_solve={eval_metrics[f'stage{si}/solve_rate']:.3f}"
         )
         trainer.save_model(args.output_dir)
         save_latent_projector_state(final_model, args.output_dir)
@@ -1167,6 +1385,7 @@ def main() -> None:
             extra_save_fn=save_latent_projector_state,
         )
         if wb_run is not None:
+            wandb.log({f"final_eval/{k}": float(v) for k, v in eval_metrics.items()})
             wb_run.finish()
 
 
