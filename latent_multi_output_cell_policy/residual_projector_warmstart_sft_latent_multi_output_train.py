@@ -44,6 +44,7 @@ from latent_multi_output_cell_policy.grpo_residual_projector_latent_train import
     maybe_load_projector_state,
     pick_dtype,
     project_hidden,
+    residual_next_token_logits_from_ids as shared_residual_next_token_logits_from_ids,
     sample_latent_completion,
     save_latent_projector_state,
     unwrap_backbone,
@@ -288,9 +289,9 @@ def load_weighted_training_row_groups(args: Args) -> tuple[float, List[Dict[str,
 def residual_next_token_logits_from_ids(
     model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor, num_cot_tokens: int
 ) -> torch.Tensor:
-    base_hidden, latent_hidden = build_latent_hidden(model, input_ids, attention_mask, num_cot_tokens)
-    final_hidden = base_hidden + project_hidden(model, latent_hidden - base_hidden)
-    return get_output_embeddings_module(model)(final_hidden)
+    # Keep SFT teacher-forced CE aligned with the same latent logits path used by
+    # eval / rollout decoding, including mix-gating, clipping, and fallback logic.
+    return shared_residual_next_token_logits_from_ids(model, input_ids, attention_mask, num_cot_tokens)
 
 
 def latent_residual_completion_ce_loss(
