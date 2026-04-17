@@ -11,9 +11,8 @@ from addition.config import ExperimentConfig
 @dataclass
 class ModelOutput:
     digit_logits: torch.Tensor
-    carry_logits: torch.Tensor
-    final_hidden: torch.Tensor
-    readout_hidden: torch.Tensor
+    final_carry_logits: torch.Tensor
+    output_hidden: torch.Tensor
     latent_history: list[torch.Tensor]
     attention_weights: torch.Tensor | None
 
@@ -56,6 +55,7 @@ class AdditionTransformer(nn.Module):
         self.token_embedding = nn.Embedding(config.discrete_vocab_size, config.d_model)
         self.position_embedding = nn.Embedding(config.max_sequence_length, config.d_model)
         self.latent_type_embedding = nn.Parameter(torch.zeros(config.d_model))
+        self.output_slot_embeddings = nn.Parameter(torch.zeros(config.output_sequence_length, config.d_model))
         self.block = TransformerBlock(
             d_model=config.d_model,
             n_heads=config.n_heads,
@@ -63,23 +63,36 @@ class AdditionTransformer(nn.Module):
             dropout=config.dropout,
         )
         self.final_ln = nn.LayerNorm(config.d_model)
-        self.digit_head = nn.Linear(config.d_model, 10)
-        self.carry_head = nn.Linear(config.d_model, 2)
+        self.digit_head = nn.Linear(config.d_model, config.digit_vocab_size)
+        self.final_carry_head = nn.Linear(config.d_model, 2)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.latent_type_embedding, mean=0.0, std=0.02)
+        nn.init.normal_(self.output_slot_embeddings, mean=0.0, std=0.02)
         nn.init.xavier_uniform_(self.digit_head.weight)
         nn.init.zeros_(self.digit_head.bias)
-        nn.init.xavier_uniform_(self.carry_head.weight)
-        nn.init.zeros_(self.carry_head.bias)
+        nn.init.xavier_uniform_(self.final_carry_head.weight)
+        nn.init.zeros_(self.final_carry_head.bias)
 
     def embed_discrete_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
         seq_len = input_ids.shape[1]
         positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
         return self.token_embedding(input_ids) + self.position_embedding(positions)
+
+    def embed_output_slots(
+        self,
+        batch_size: int,
+        output_length: int,
+        latent_count: int,
+        input_length: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        positions = torch.arange(output_length, device=device) + input_length + latent_count
+        positioned = self.output_slot_embeddings[:output_length] + self.position_embedding(positions)
+        return positioned.unsqueeze(0).expand(batch_size, -1, -1)
 
     def _run_block(
         self,
@@ -101,32 +114,53 @@ class AdditionTransformer(nn.Module):
         base_embeddings = self.embed_discrete_tokens(input_ids)
         latent_history: list[torch.Tensor] = []
         attention_weights: torch.Tensor | None = None
-
-        hidden_states, attention_weights = self._run_block(base_embeddings, need_attention=return_attention)
-        readout_hidden = hidden_states[:, -1, :]
-        latent_history.append(readout_hidden)
+        batch_size = input_ids.shape[0]
+        input_length = input_ids.shape[1]
+        active_digits = max(1, (input_length - 2) // 2)
+        output_length = active_digits + 1
+        output_embeddings = self.embed_output_slots(
+            batch_size=batch_size,
+            output_length=output_length,
+            latent_count=0,
+            input_length=input_length,
+            device=input_ids.device,
+        )
+        hidden_states, attention_weights = self._run_block(
+            torch.cat([base_embeddings, output_embeddings], dim=1),
+            need_attention=return_attention,
+        )
+        output_hidden = hidden_states[:, -output_length:, :]
+        summary_hidden = output_hidden[:, -1, :]
+        latent_history.append(summary_hidden)
 
         latent_embeddings: list[torch.Tensor] = []
         for step_index in range(int(latent_steps)):
-            latent_token = readout_hidden.unsqueeze(1) + self.latent_type_embedding.view(1, 1, -1)
-            latent_position_index = base_embeddings.shape[1] + step_index
+            latent_token = summary_hidden.unsqueeze(1) + self.latent_type_embedding.view(1, 1, -1)
+            latent_position_index = input_length + step_index
             latent_token = latent_token + self.position_embedding.weight[latent_position_index].view(1, 1, -1)
             latent_embeddings.append(latent_token)
+            output_embeddings = self.embed_output_slots(
+                batch_size=batch_size,
+                output_length=output_length,
+                latent_count=len(latent_embeddings),
+                input_length=input_length,
+                device=input_ids.device,
+            )
             hidden_states, attention_weights = self._run_block(
-                torch.cat([base_embeddings] + latent_embeddings, dim=1),
+                torch.cat([base_embeddings] + latent_embeddings + [output_embeddings], dim=1),
                 need_attention=return_attention,
             )
-            readout_hidden = hidden_states[:, -1, :]
-            latent_history.append(readout_hidden)
+            latent_index = input_length + step_index
+            summary_hidden = hidden_states[:, latent_index, :]
+            output_hidden = hidden_states[:, -output_length:, :]
+            latent_history.append(summary_hidden)
 
-        final_hidden = readout_hidden
-        digit_logits = self.digit_head(final_hidden)
-        carry_logits = self.carry_head(final_hidden)
+        digit_logits = self.digit_head(output_hidden[:, :active_digits, :])
+        final_carry_logits = self.final_carry_head(output_hidden[:, -1, :])
         return ModelOutput(
             digit_logits=digit_logits,
-            carry_logits=carry_logits,
-            final_hidden=final_hidden,
-            readout_hidden=readout_hidden,
+            final_carry_logits=final_carry_logits,
+            output_hidden=output_hidden,
             latent_history=latent_history,
             attention_weights=attention_weights,
         )

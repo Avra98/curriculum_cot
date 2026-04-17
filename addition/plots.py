@@ -18,7 +18,7 @@ def plot_training_history(history: list[dict[str, Any]], output_dir: Path) -> li
     output_dir.mkdir(parents=True, exist_ok=True)
     steps = [entry["global_step"] for entry in history]
     digit_acc = [entry["validation_digit_accuracy"] for entry in history]
-    carry_acc = [entry["validation_carry_accuracy"] for entry in history]
+    carry_acc = [entry["validation_final_carry_accuracy"] for entry in history]
     exact_match = [entry["validation_exact_match"] for entry in history]
     stages = [entry["stage"] for entry in history]
 
@@ -26,7 +26,7 @@ def plot_training_history(history: list[dict[str, Any]], output_dir: Path) -> li
 
     plt.figure(figsize=(8, 4.5))
     plt.plot(steps, digit_acc, label="Val digit acc")
-    plt.plot(steps, carry_acc, label="Val carry acc")
+    plt.plot(steps, carry_acc, label="Val final carry acc")
     plt.plot(steps, exact_match, label="Val exact match")
     plt.xlabel("Global step")
     plt.ylabel("Accuracy")

@@ -1,6 +1,6 @@
 # Addition Carry Experiment
 
-This folder contains a standalone PyTorch experiment for algorithmic decimal addition with carry on a one-layer decoder-only Transformer.
+This folder contains a standalone PyTorch experiment for algorithmic addition with carry on a one-layer decoder-only Transformer.
 
 The comparison includes exactly three methods:
 
@@ -10,12 +10,15 @@ The comparison includes exactly three methods:
 
 ## Task
 
-Each example adds two reversed digit sequences. Stage `k` means only the first `k` least-significant positions vary and the rest are zero. The model is queried position by position and predicts:
+Each example adds two reversed digit sequences in a configurable radix. Stage `k` means only the first `k` least-significant positions vary and the rest are zero. Every method now trains on the full example in one forward pass:
 
-- the sum digit at the queried position
-- the carry bit leaving that position
+- predict all `k` active sum digits
+- predict the final carry bit as an additional output slot
+- compute masked loss over the active digits plus the final carry
 
-The latent method reuses the same one-layer Transformer recurrently. After each pass, the final hidden state is appended as a continuous latent token and the same layer is run again.
+This means the baseline and both curriculum variants learn whole-example addition rather than a single queried digit at a time. Internal carry targets are still kept for diagnostics and linear probing, but not as an auxiliary training loss.
+
+The latent method reuses the same one-layer Transformer recurrently. After an initial pass over the inputs and output slots, the model appends continuous latent scratchpad tokens before the output slots and reruns the same layer, giving later curriculum stages more internal workspace for carry-like computation.
 
 ## Files
 
@@ -48,6 +51,12 @@ Default settings:
 python addition/train.py --model nocurr_nocot --use_wandb
 python addition/train.py --model curr_nocot --use_wandb
 python addition/train.py --model curr_cot --use_wandb
+```
+
+The default backbone now uses a single attention head. To run a harder hexadecimal setting:
+
+```bash
+python addition/train.py --model curr_cot --radix 16 --use_wandb --output_dir addition_runs/hex_curr_cot
 ```
 
 Run offline or local-only:
@@ -83,8 +92,8 @@ python addition/run_comparison.py --preset smoke --no_wandb --comparison_output_
 
 The experiment reports:
 
-- digit accuracy by queried position
-- carry accuracy by queried position
+- digit accuracy by output position
+- final-carry accuracy
 - exact whole-sum accuracy by active length
 - average digit accuracy by length
 - in-distribution results up to `train_max_digits`
@@ -95,8 +104,8 @@ The experiment reports:
 
 The evaluation also includes:
 
-- a linear probe on hidden states for carry prediction
-- attention summaries showing how strongly the final readout attends to current digits and latent tokens
+- a linear probe on output-slot hidden states for carry prediction
+- attention summaries showing how strongly the final carry readout attends to operand digits, previous output slots, and latent tokens
 
 ## Notes
 

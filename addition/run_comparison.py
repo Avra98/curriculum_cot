@@ -22,7 +22,7 @@ def _mean_std(values: list[float]) -> dict[str, float]:
 
 def _aggregate_split_metrics(run_summaries: list[dict[str, Any]], split_name: str) -> dict[str, Any]:
     lengths = sorted(run_summaries[0]["final_results"][split_name].keys(), key=int)
-    metric_names = ["digit_accuracy", "carry_accuracy", "exact_match", "avg_carry_chain", "avg_carry_density"]
+    metric_names = ["digit_accuracy", "final_carry_accuracy", "exact_match", "avg_carry_chain", "avg_carry_density"]
     aggregated: dict[str, Any] = {}
     for length in lengths:
         aggregated[length] = {}

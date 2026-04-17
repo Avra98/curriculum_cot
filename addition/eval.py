@@ -23,13 +23,12 @@ from addition.model import AdditionTransformer
 @dataclass
 class LengthMetrics:
     digit_accuracy: float
-    carry_accuracy: float
+    final_carry_accuracy: float
     exact_match: float
     avg_carry_chain: float
     avg_carry_density: float
     example_count: int
     per_position_digit_accuracy: list[float]
-    per_position_carry_accuracy: list[float]
 
 
 def _chunked(sequence: list[AdditionProblem], chunk_size: int) -> Iterable[list[AdditionProblem]]:
@@ -53,72 +52,61 @@ def evaluate_problem_set(
     if num_examples == 0:
         empty = LengthMetrics(
             digit_accuracy=0.0,
-            carry_accuracy=0.0,
+            final_carry_accuracy=0.0,
             exact_match=0.0,
             avg_carry_chain=0.0,
             avg_carry_density=0.0,
             example_count=0,
             per_position_digit_accuracy=[0.0] * active_digits,
-            per_position_carry_accuracy=[0.0] * active_digits,
         )
         return empty, None
 
     predicted_digits = torch.zeros(num_examples, active_digits, dtype=torch.long)
-    predicted_carry = torch.zeros(num_examples, active_digits, dtype=torch.long)
-    truth_digits = torch.tensor(
-        [[problem.sum_digits[position] for position in range(active_digits)] for problem in problems],
-        dtype=torch.long,
-    )
-    truth_carry = torch.tensor(
-        [[problem.carry_out[position] for position in range(active_digits)] for problem in problems],
-        dtype=torch.long,
-    )
+    predicted_final_carry = torch.zeros(num_examples, dtype=torch.long)
+    truth_digits = torch.tensor([[problem.sum_digits[position] for position in range(active_digits)] for problem in problems], dtype=torch.long)
+    truth_final_carry = torch.tensor([problem.carry_out[active_digits - 1] for problem in problems], dtype=torch.long)
     attention_stats: dict[str, float] | None = None
 
-    for position in range(active_digits):
-        offset = 0
-        for problem_chunk in _chunked(problems, config.eval_batch_size):
-            batch = build_batch(
-                problems=problem_chunk,
-                query_positions=[position] * len(problem_chunk),
-                max_digits=config.eval_max_digits,
-                device=device,
+    offset = 0
+    for problem_chunk in _chunked(problems, config.eval_batch_size):
+        batch = build_batch(
+            problems=problem_chunk,
+            radix=config.radix,
+            device=device,
+        )
+        outputs = model(batch.input_ids, latent_steps=latent_steps, return_attention=return_attention)
+        chunk_size = len(problem_chunk)
+        predicted_digits[offset : offset + chunk_size] = outputs.digit_logits.argmax(dim=-1)[:, :active_digits].cpu()
+        predicted_final_carry[offset : offset + chunk_size] = outputs.final_carry_logits.argmax(dim=-1).cpu()
+        if return_attention and attention_stats is None:
+            attention_stats = summarize_attention(
+                attention_weights=outputs.attention_weights,
+                active_digits=active_digits,
+                input_sequence_length=batch.input_ids.shape[1],
+                output_sequence_length=outputs.output_hidden.shape[1],
             )
-            outputs = model(batch.input_ids, latent_steps=latent_steps, return_attention=return_attention)
-            chunk_size = len(problem_chunk)
-            predicted_digits[offset : offset + chunk_size, position] = outputs.digit_logits.argmax(dim=-1).cpu()
-            predicted_carry[offset : offset + chunk_size, position] = outputs.carry_logits.argmax(dim=-1).cpu()
-            if return_attention and attention_stats is None:
-                attention_stats = summarize_attention(
-                    attention_weights=outputs.attention_weights,
-                    query_position=position,
-                    max_digits=config.eval_max_digits,
-                    base_sequence_length=config.base_sequence_length,
-                )
-            offset += chunk_size
+        offset += chunk_size
 
     exact_matches = []
     for example_index, problem in enumerate(problems):
         exact_matches.append(
             exact_sum_matches(
                 predicted_digits=predicted_digits[example_index].tolist(),
-                predicted_final_carry=int(predicted_carry[example_index, active_digits - 1].item()),
+                predicted_final_carry=int(predicted_final_carry[example_index].item()),
                 truth_digits=problem.sum_digits[:active_digits],
                 truth_final_carry=problem.carry_out[active_digits - 1],
             )
         )
 
     per_position_digit = (predicted_digits == truth_digits).float().mean(dim=0).tolist()
-    per_position_carry = (predicted_carry == truth_carry).float().mean(dim=0).tolist()
     metrics = LengthMetrics(
         digit_accuracy=float((predicted_digits == truth_digits).float().mean().item()),
-        carry_accuracy=float((predicted_carry == truth_carry).float().mean().item()),
+        final_carry_accuracy=float((predicted_final_carry == truth_final_carry).float().mean().item()),
         exact_match=float(torch.tensor(exact_matches, dtype=torch.float32).mean().item()),
         avg_carry_chain=float(sum(count_carry_chain(problem) for problem in problems) / len(problems)),
         avg_carry_density=float(sum(carry_density(problem) for problem in problems) / len(problems)),
         example_count=len(problems),
         per_position_digit_accuracy=[float(value) for value in per_position_digit],
-        per_position_carry_accuracy=[float(value) for value in per_position_carry],
     )
     return metrics, attention_stats
 
@@ -126,26 +114,28 @@ def evaluate_problem_set(
 def summarize_attention(
     attention_weights: torch.Tensor | None,
     *,
-    query_position: int,
-    max_digits: int,
-    base_sequence_length: int,
+    active_digits: int,
+    input_sequence_length: int,
+    output_sequence_length: int,
 ) -> dict[str, float]:
     if attention_weights is None:
         return {}
     # Shape: [batch, heads, target_len, source_len]
     final_attention = attention_weights[:, :, -1, :]
     attention_mean = final_attention.mean(dim=(0, 1))
-    a_index = 1 + query_position
-    b_index = max_digits + 2 + query_position
-    latent_slice = attention_mean[base_sequence_length:]
+    active_last_a_index = active_digits
+    active_last_b_index = input_sequence_length // 2 + active_digits
+    latent_slice = attention_mean[input_sequence_length : -output_sequence_length]
+    output_slice = attention_mean[-output_sequence_length:-1]
     entropy = -torch.sum(attention_mean * torch.log(attention_mean.clamp_min(1e-9))).item()
     summary = {
-        "current_a_attention": float(attention_mean[a_index].item()),
-        "current_b_attention": float(attention_mean[b_index].item()),
-        "query_token_attention": float(attention_mean[base_sequence_length - 1].item()),
+        "lsd_a_attention": float(attention_mean[1].item()),
+        "msd_a_attention": float(attention_mean[active_last_a_index].item()),
+        "lsd_b_attention": float(attention_mean[(input_sequence_length // 2) + 1].item()),
+        "msd_b_attention": float(attention_mean[active_last_b_index].item()),
         "attention_entropy": float(entropy),
         "all_latent_attention": float(latent_slice.sum().item()) if latent_slice.numel() else 0.0,
-        "previous_latent_attention": float(latent_slice[-2].item()) if latent_slice.numel() >= 2 else 0.0,
+        "previous_output_attention": float(output_slice.sum().item()) if output_slice.numel() else 0.0,
     }
     return summary
 
@@ -171,13 +161,12 @@ def evaluate_length_dict(
         )
         structured[str(length)] = {
             "digit_accuracy": length_metrics.digit_accuracy,
-            "carry_accuracy": length_metrics.carry_accuracy,
+            "final_carry_accuracy": length_metrics.final_carry_accuracy,
             "exact_match": length_metrics.exact_match,
             "avg_carry_chain": length_metrics.avg_carry_chain,
             "avg_carry_density": length_metrics.avg_carry_density,
             "example_count": length_metrics.example_count,
             "per_position_digit_accuracy": length_metrics.per_position_digit_accuracy,
-            "per_position_carry_accuracy": length_metrics.per_position_carry_accuracy,
         }
         if attention is not None:
             structured[str(length)]["attention_summary"] = attention
@@ -199,17 +188,17 @@ def collect_hidden_dataset(
     hidden_states: list[torch.Tensor] = []
     carry_targets: list[torch.Tensor] = []
     with torch.no_grad():
-        for position in range(active_digits):
-            for problem_chunk in _chunked(selected, config.eval_batch_size):
-                batch = build_batch(
-                    problems=problem_chunk,
-                    query_positions=[position] * len(problem_chunk),
-                    max_digits=config.eval_max_digits,
-                    device=device,
-                )
-                outputs = model(batch.input_ids, latent_steps=latent_steps, return_attention=False)
-                hidden_states.append(outputs.final_hidden.detach().cpu())
-                carry_targets.append(batch.target_carry.detach().cpu())
+        for problem_chunk in _chunked(selected, config.eval_batch_size):
+            batch = build_batch(
+                problems=problem_chunk,
+                radix=config.radix,
+                device=device,
+            )
+            outputs = model(batch.input_ids, latent_steps=latent_steps, return_attention=False)
+            slot_hidden = outputs.output_hidden[:, :active_digits, :]
+            slot_mask = batch.target_digit_mask
+            hidden_states.append(slot_hidden[slot_mask].detach().cpu())
+            carry_targets.append(batch.target_carry[slot_mask].detach().cpu())
     return torch.cat(hidden_states, dim=0), torch.cat(carry_targets, dim=0)
 
 
