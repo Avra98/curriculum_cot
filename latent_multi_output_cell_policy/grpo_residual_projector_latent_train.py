@@ -55,6 +55,8 @@ class Args:
     gpu_id: int
     stage_i: int
     num_cot_tokens: int
+    latent_mode: str
+    max_latent_seeds: int
     total_empties_hint: int
     per_device_train_batch_size: int
     gradient_accumulation_steps: int
@@ -393,12 +395,19 @@ def get_last_hidden_state(model_output: Any) -> torch.Tensor:
     return model_output.hidden_states[-1]
 
 
-def run_backbone_from_embeds(backbone: nn.Module, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor):
+def run_backbone_from_embeds(
+    backbone: nn.Module,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor,
+    *,
+    output_attentions: bool = False,
+):
     base = unwrap_backbone(backbone)
     inner = getattr(base, "model", base)
     return inner(
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
+        output_attentions=bool(output_attentions),
         output_hidden_states=False,
         return_dict=True,
         use_cache=False,
@@ -408,6 +417,81 @@ def run_backbone_from_embeds(backbone: nn.Module, inputs_embeds: torch.Tensor, a
 def extend_attention_mask(mask: torch.Tensor, extra_tokens: int) -> torch.Tensor:
     extra = torch.ones(mask.shape[0], int(extra_tokens), dtype=mask.dtype, device=mask.device)
     return torch.cat([mask, extra], dim=1)
+
+
+def _maybe_print_attention_density(model: nn.Module, attentions: Any, *, label: str) -> None:
+    debug_count = int(getattr(model, "_attention_density_debug_count", 0))
+    debug_limit = int(getattr(model, "_attention_density_debug_limit", 0))
+    if debug_limit <= 0 or debug_count >= debug_limit or attentions is None:
+        return
+
+    threshold_mult = float(getattr(model, "_attention_density_threshold_mult", 1.0))
+    summaries: list[str] = []
+    for layer_idx, layer_attn in enumerate(attentions):
+        if layer_attn is None or layer_attn.ndim != 4 or int(layer_attn.shape[0]) <= 0:
+            continue
+        probs = layer_attn[0].float().clamp_min(1e-8)
+        seq_len = int(probs.shape[-1])
+        uniform = 1.0 / max(1, seq_len)
+        dense_frac = float((probs > (threshold_mult * uniform)).float().mean().item())
+        entropy = -(probs * probs.log()).sum(dim=-1)
+        eff_support = float((entropy.exp() / max(1, seq_len)).mean().item())
+        final_row = probs[:, -1, :]
+        final_row_entropy = -(final_row * final_row.log()).sum(dim=-1)
+        final_row_eff = float((final_row_entropy.exp() / max(1, seq_len)).mean().item())
+        final_row_max = float(final_row.max(dim=-1).values.mean().item())
+        summaries.append(
+            f"L{layer_idx}:dense>{threshold_mult:.1f}u={dense_frac:.3f},eff={eff_support:.3f},"
+            f"final_eff={final_row_eff:.3f},final_max={final_row_max:.3f}"
+        )
+
+    if summaries:
+        print(f"[attention density] {label} " + " | ".join(summaries), flush=True)
+        model._attention_density_debug_count = debug_count + 1
+
+
+def _maybe_print_fixed_slot_debug(
+    model: nn.Module,
+    *,
+    input_ids: torch.Tensor,
+    latent_hiddens: torch.Tensor,
+    final_hidden: torch.Tensor,
+    logits: torch.Tensor,
+) -> None:
+    debug_count = int(getattr(model, "_fixed_slot_debug_count", 0))
+    debug_limit = int(getattr(model, "_fixed_slot_debug_limit", 0))
+    if debug_limit <= 0 or debug_count >= debug_limit or int(logits.shape[0]) <= 0:
+        return
+
+    tokenizer = getattr(model, "_latent_debug_tokenizer", None)
+    topk = 1
+    probs = torch.softmax(logits[0].float(), dim=-1)
+    top_probs, top_ids = torch.topk(probs, k=min(topk, int(probs.shape[-1])), dim=-1)
+
+    def _fmt(ids: torch.Tensor, probs: torch.Tensor) -> str:
+        parts = []
+        for tok_id, prob in zip(ids.tolist(), probs.tolist(), strict=True):
+            piece = repr(tokenizer.decode([int(tok_id)])) if tokenizer is not None else f"id={int(tok_id)}"
+            parts.append(f"{piece}:{float(prob):.4f}")
+        return " | ".join(parts)
+
+    print(
+        "[fixed slot debug] "
+        f"token_step={debug_count} "
+        f"next_top1={_fmt(top_ids, top_probs)}",
+        flush=True,
+    )
+    model._fixed_slot_debug_count = debug_count + 1
+
+
+def _maybe_print_fixed_slot_decode_debug(model: nn.Module, tokenizer: Any, next_id: torch.Tensor, step_idx: int) -> None:
+    debug_count = int(getattr(model, "_fixed_slot_decode_debug_count", 0))
+    debug_limit = int(getattr(model, "_fixed_slot_decode_debug_limit", 0))
+    if debug_limit <= 0 or debug_count >= debug_limit or int(next_id.shape[0]) <= 0:
+        return
+    piece = repr(tokenizer.decode([int(next_id[0, 0].item())])) if tokenizer is not None else f"id={int(next_id[0, 0].item())}"
+    print(f"[fixed slot decode] step={step_idx} next_token={piece}", flush=True)
+    model._fixed_slot_decode_debug_count = debug_count + 1
 
 
 def attach_residual_projector_modules(model: nn.Module, hidden_size: int, projector_hidden: int = PROJECTOR_HIDDEN) -> None:
@@ -425,6 +509,31 @@ def attach_residual_projector_modules(model: nn.Module, hidden_size: int, projec
     nn.init.zeros_(model.latent_projector_in.bias)
     nn.init.xavier_uniform_(model.latent_projector_out.weight)
     nn.init.zeros_(model.latent_projector_out.bias)
+
+
+def attach_fixed_latent_slot_modules(model: nn.Module, hidden_size: int, max_latent_slots: int = 8) -> None:
+    if hasattr(model, "fixed_latent_slots") and hasattr(model, "fixed_final_slot_embed"):
+        return
+    max_latent_slots = max(1, int(max_latent_slots))
+    model.fixed_latent_slots = nn.Parameter(torch.randn(max_latent_slots, hidden_size) * 0.02)
+    model.fixed_final_slot_embed = nn.Parameter(torch.randn(hidden_size) * 0.02)
+    nn.init.normal_(model.fixed_latent_slots, std=0.02)
+    nn.init.normal_(model.fixed_final_slot_embed, std=0.02)
+
+
+def maybe_load_fixed_slot_state(model: nn.Module, path_or_dir: str) -> bool:
+    state_path = str(path_or_dir)
+    if os.path.isdir(state_path):
+        state_path = os.path.join(state_path, "fixed_slot_latent_state.pt")
+    if not os.path.exists(state_path):
+        return False
+    state = torch.load(state_path, map_location="cpu")
+    with torch.no_grad():
+        if "fixed_latent_slots" in state:
+            model.fixed_latent_slots.copy_(state["fixed_latent_slots"].to(model.fixed_latent_slots))
+        if "fixed_final_slot_embed" in state:
+            model.fixed_final_slot_embed.copy_(state["fixed_final_slot_embed"].to(model.fixed_final_slot_embed))
+    return True
 
 
 def maybe_load_projector_state(model: nn.Module, path_or_dir: str) -> bool:
@@ -473,6 +582,19 @@ def infer_projector_hidden_from_state(path_or_dir: str) -> int | None:
     return None
 
 
+def infer_fixed_slot_count_from_state(path_or_dir: str) -> int | None:
+    state_path = str(path_or_dir)
+    if os.path.isdir(state_path):
+        state_path = os.path.join(state_path, "fixed_slot_latent_state.pt")
+    if not os.path.exists(state_path):
+        return None
+    state = torch.load(state_path, map_location="cpu")
+    slots = state.get("fixed_latent_slots")
+    if isinstance(slots, torch.Tensor) and slots.ndim == 2:
+        return int(slots.shape[0])
+    return None
+
+
 def save_latent_projector_state(model: nn.Module, output_dir: str) -> None:
     state = {
         "special_thought_embed": model.special_thought_embed.detach().cpu(),
@@ -483,6 +605,125 @@ def save_latent_projector_state(model: nn.Module, output_dir: str) -> None:
         "latent_projector_out_bias": model.latent_projector_out.bias.detach().cpu(),
     }
     torch.save(state, os.path.join(output_dir, "latent_cot_state.pt"))
+
+
+def save_fixed_slot_latent_state(model: nn.Module, output_dir: str) -> None:
+    state = {
+        "fixed_latent_slots": model.fixed_latent_slots.detach().cpu(),
+        "fixed_final_slot_embed": model.fixed_final_slot_embed.detach().cpu(),
+    }
+    torch.save(state, os.path.join(output_dir, "fixed_slot_latent_state.pt"))
+
+
+def attach_latent_seed_modules(model: nn.Module, hidden_size: int, max_latent_seeds: int = 8) -> None:
+    """Option-2 architecture: a bank of trainable latent seed vectors m_1..m_k
+    that are appended to the prompt embeddings. Only LoRA + these seeds are
+    trained. Seeds persist across examples and (after save/load) across
+    curriculum stages, giving the model an explicit "latent memory" that can
+    carry information across complexity stages.
+
+    Shape: ``model.latent_seed_embeds`` is ``nn.Parameter[max_latent_seeds, d]``.
+    """
+    if hasattr(model, "latent_seed_embeds"):
+        return
+    max_latent_seeds = max(1, int(max_latent_seeds))
+    model.latent_seed_embeds = nn.Parameter(torch.randn(max_latent_seeds, hidden_size) * 0.02)
+    nn.init.normal_(model.latent_seed_embeds, std=0.02)
+
+
+def maybe_load_latent_seed_state(model: nn.Module, path_or_dir: str) -> bool:
+    state_path = str(path_or_dir)
+    if os.path.isdir(state_path):
+        state_path = os.path.join(state_path, "latent_seed_state.pt")
+    if not os.path.exists(state_path):
+        return False
+    state = torch.load(state_path, map_location="cpu")
+    if "latent_seed_embeds" not in state:
+        return False
+    with torch.no_grad():
+        saved = state["latent_seed_embeds"]
+        target = model.latent_seed_embeds
+        shared = min(int(saved.shape[0]), int(target.shape[0]))
+        if shared > 0:
+            target[:shared].copy_(saved[:shared].to(target))
+    return True
+
+
+def infer_latent_seed_count_from_state(path_or_dir: str) -> int | None:
+    state_path = str(path_or_dir)
+    if os.path.isdir(state_path):
+        state_path = os.path.join(state_path, "latent_seed_state.pt")
+    if not os.path.exists(state_path):
+        return None
+    state = torch.load(state_path, map_location="cpu")
+    seeds = state.get("latent_seed_embeds")
+    if isinstance(seeds, torch.Tensor) and seeds.ndim == 2:
+        return int(seeds.shape[0])
+    return None
+
+
+def save_latent_seed_state(model: nn.Module, output_dir: str) -> None:
+    state = {"latent_seed_embeds": model.latent_seed_embeds.detach().cpu()}
+    torch.save(state, os.path.join(output_dir, "latent_seed_state.pt"))
+
+
+def build_fixed_slot_latent_hidden(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    num_cot_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    backbone = unwrap_backbone(model)
+    inner_backbone = getattr(backbone, "model", backbone)
+    input_embeds = get_input_embeddings_module(model)(input_ids)
+    base_out = inner_backbone(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=False,
+        return_dict=True,
+        use_cache=False,
+    )
+    base_hidden = get_last_hidden_state(base_out)[:, -1, :]
+
+    slot_bank = model.fixed_latent_slots.to(device=input_embeds.device, dtype=input_embeds.dtype)
+    slot_count = min(max(0, int(num_cot_tokens)), int(slot_bank.shape[0]))
+    latent_slots = slot_bank[:slot_count].unsqueeze(0).expand(input_embeds.shape[0], slot_count, slot_bank.shape[-1])
+    final_slot = model.fixed_final_slot_embed.to(device=input_embeds.device, dtype=input_embeds.dtype).view(1, 1, -1)
+    final_slot = final_slot.expand(input_embeds.shape[0], 1, final_slot.shape[-1])
+
+    if slot_count > 0:
+        full_embeds = torch.cat([input_embeds, latent_slots, final_slot], dim=1)
+    else:
+        full_embeds = torch.cat([input_embeds, final_slot], dim=1)
+    full_mask = extend_attention_mask(attention_mask, slot_count + 1)
+    capture_attn = bool(getattr(model, "_attention_density_debug_limit", 0) > 0)
+    full_out = run_backbone_from_embeds(backbone, full_embeds, full_mask, output_attentions=capture_attn)
+    _maybe_print_attention_density(model, getattr(full_out, "attentions", None), label="fixed_slots")
+    full_hidden = get_last_hidden_state(full_out)
+    latent_hiddens = full_hidden[:, input_embeds.shape[1] : input_embeds.shape[1] + slot_count, :]
+    final_hidden = full_hidden[:, -1, :]
+    return base_hidden, latent_hiddens, final_hidden
+
+
+def fixed_slot_next_token_logits_from_ids(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    num_cot_tokens: int,
+) -> torch.Tensor:
+    _, latent_hiddens, final_hidden = build_fixed_slot_latent_hidden(model, input_ids, attention_mask, num_cot_tokens)
+    output_embeddings = get_output_embeddings_module(model)
+    output_dtype = getattr(getattr(output_embeddings, "weight", None), "dtype", final_hidden.dtype)
+    logits = output_embeddings(final_hidden.to(dtype=output_dtype))
+    logits = _sanitize_logits(logits, output_dtype=output_dtype)
+    _maybe_print_fixed_slot_debug(
+        model,
+        input_ids=input_ids,
+        latent_hiddens=latent_hiddens,
+        final_hidden=final_hidden,
+        logits=logits,
+    )
+    return logits
 
 
 def project_hidden(model: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
@@ -510,7 +751,49 @@ def _sanitize_logits(logits: torch.Tensor, *, output_dtype: torch.dtype) -> torc
     return logits.to(dtype=output_dtype)
 
 
+def _debug_print_vocab_comparison(
+    model: nn.Module,
+    base_logits: torch.Tensor,
+    latent_logits: torch.Tensor,
+    *,
+    fallback_mask: torch.Tensor,
+) -> None:
+    debug_count = int(getattr(model, "_latent_vocab_debug_count", 0))
+    debug_limit = int(getattr(model, "_latent_vocab_debug_limit", 10000))
+    if debug_count >= debug_limit or int(base_logits.shape[0]) <= 0:
+        return
+
+    tokenizer = getattr(model, "_latent_debug_tokenizer", None)
+    topk = max(1, int(getattr(model, "_latent_vocab_debug_topk", 1)))
+    base_probs = torch.softmax(base_logits[0].float(), dim=-1)
+    latent_probs = torch.softmax(latent_logits[0].float(), dim=-1)
+    base_top_probs, base_top_ids = torch.topk(base_probs, k=min(topk, int(base_probs.shape[-1])), dim=-1)
+    latent_top_probs, latent_top_ids = torch.topk(latent_probs, k=min(topk, int(latent_probs.shape[-1])), dim=-1)
+    gate = float(torch.sigmoid(model.latent_mix_logit.float()).item()) if hasattr(model, "latent_mix_logit") else float("nan")
+
+    def _fmt(ids: torch.Tensor, probs: torch.Tensor) -> str:
+        parts = []
+        for tok_id, prob in zip(ids.tolist(), probs.tolist(), strict=True):
+            piece = repr(tokenizer.decode([int(tok_id)])) if tokenizer is not None else f"id={int(tok_id)}"
+            parts.append(f"{piece}:{float(prob):.4f}")
+        return " | ".join(parts)
+
+    print(
+        "[latent vocab debug] "
+        f"token_step={debug_count} "
+        f"gate={gate:.6f} "
+        f"fallback_row0={bool(fallback_mask[0].item())} "
+        f"base_next={_fmt(base_top_ids, base_top_probs)} "
+        f"latent_next={_fmt(latent_top_ids, latent_top_probs)}",
+        flush=True,
+    )
+    model._latent_vocab_debug_count = debug_count + 1
+
+
 def _should_fallback_to_base(model: nn.Module, latent_logits: torch.Tensor) -> torch.Tensor:
+    # Safety checker for latent decoding: if the latent-steered logits become too
+    # sharp / low-entropy / numerically suspicious, ignore them for that row and
+    # fall back to plain base-model logits instead.
     scores = torch.nan_to_num(latent_logits.float(), nan=0.0, posinf=50.0, neginf=-50.0)
     probs = torch.softmax(scores, dim=-1)
     probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
@@ -548,9 +831,57 @@ def build_latent_hidden(model: nn.Module, input_ids: torch.Tensor, attention_mas
     cur_mask = attention_mask
     latent_token = None
     special = model.special_thought_embed.to(device=input_embeds.device, dtype=input_embeds.dtype).view(1, 1, -1)
-    for _ in range(int(num_cot_tokens)):
+    for step_idx in range(int(num_cot_tokens)):
+        # This is the actual latent-thought rollout: append one hidden "thought"
+        # token, rerun the backbone, then feed the resulting last hidden state back
+        # in as the next latent token embedding.
         next_embed = special.expand(cur_embeds.shape[0], 1, -1) if latent_token is None else latent_token
+        # print(
+        #     f"[latent rollout shapes] step={step_idx} "
+        #     f"next_embed={tuple(next_embed.shape)} cur_embeds_before={tuple(cur_embeds.shape)} "
+        #     f"cur_mask_before={tuple(cur_mask.shape)}",
+        #     flush=True,
+        # )
         cur_embeds = torch.cat([cur_embeds, next_embed], dim=1)
+        cur_mask = extend_attention_mask(cur_mask, 1)
+        out = run_backbone_from_embeds(backbone, cur_embeds, cur_mask)
+        latent_token = get_last_hidden_state(out)[:, -1:, :]
+        # print(
+        #     f"[latent rollout shapes] step={step_idx} "
+        #     f"cur_embeds_after={tuple(cur_embeds.shape)} cur_mask_after={tuple(cur_mask.shape)} "
+        #     f"latent_token={tuple(latent_token.shape)}",
+        #     flush=True,
+        # )
+    latent_hidden = latent_token[:, 0, :]
+    # print(
+    #     f"[latent rollout shapes] final base_hidden={tuple(base_hidden.shape)} latent_hidden={tuple(latent_hidden.shape)}",
+    #     flush=True,
+    # )
+    return base_hidden, latent_hidden
+
+
+def build_recurrent_hidden_latent_hidden(
+    model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor, num_cot_tokens: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    backbone = unwrap_backbone(model)
+    inner_backbone = getattr(backbone, "model", backbone)
+    input_embeds = get_input_embeddings_module(model)(input_ids)
+    base_out = inner_backbone(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=False,
+        return_dict=True,
+        use_cache=False,
+    )
+    base_hidden = get_last_hidden_state(base_out)[:, -1, :]
+    if num_cot_tokens <= 0:
+        return base_hidden, base_hidden
+
+    cur_embeds = input_embeds
+    cur_mask = attention_mask
+    latent_token = base_hidden.to(device=input_embeds.device, dtype=input_embeds.dtype).unsqueeze(1)
+    for _ in range(int(num_cot_tokens)):
+        cur_embeds = torch.cat([cur_embeds, latent_token], dim=1)
         cur_mask = extend_attention_mask(cur_mask, 1)
         out = run_backbone_from_embeds(backbone, cur_embeds, cur_mask)
         latent_token = get_last_hidden_state(out)[:, -1:, :]
@@ -558,10 +889,73 @@ def build_latent_hidden(model: nn.Module, input_ids: torch.Tensor, attention_mas
     return base_hidden, latent_hidden
 
 
+def recurrent_hidden_next_token_logits_from_ids(
+    model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor, num_cot_tokens: int
+) -> torch.Tensor:
+    _, latent_hidden = build_recurrent_hidden_latent_hidden(model, input_ids, attention_mask, num_cot_tokens)
+    output_embeddings = get_output_embeddings_module(model)
+    output_dtype = getattr(getattr(output_embeddings, "weight", None), "dtype", latent_hidden.dtype)
+    logits = output_embeddings(latent_hidden.to(dtype=output_dtype))
+    return _sanitize_logits(logits, output_dtype=output_dtype)
+
+
+def build_latent_seed_hidden(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    num_cot_tokens: int,
+) -> torch.Tensor:
+    """Option-2 forward: append k trainable seed vectors m_1..m_k to the prompt
+    embeddings and run the backbone once. The next-token hidden state is the
+    last position of the resulting hidden states.
+
+    Architecture (one backbone forward per next-token prediction):
+        inputs  = [ E[x_1], ..., E[x_T],  m_1, m_2, ..., m_k ]       # [B, T+k, d]
+        H       = f_theta(inputs)                                     # [B, T+k, d]
+        z_k     = H[:, T+k-1, :]                                      # [B, d]
+
+    Only the k seed parameters ``model.latent_seed_embeds[:k]`` and the LoRA
+    deltas get gradients. When ``num_cot_tokens == 0`` this reduces to the
+    standard last-hidden prediction (no seeds appended).
+    """
+    backbone = unwrap_backbone(model)
+    inner_backbone = getattr(backbone, "model", backbone)
+    input_embeds = get_input_embeddings_module(model)(input_ids)
+    k = max(0, int(num_cot_tokens))
+    if k <= 0:
+        base_out = inner_backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=False,
+            return_dict=True,
+            use_cache=False,
+        )
+        return get_last_hidden_state(base_out)[:, -1, :]
+    seed_bank = model.latent_seed_embeds.to(device=input_embeds.device, dtype=input_embeds.dtype)
+    k = min(k, int(seed_bank.shape[0]))
+    seed_tokens = seed_bank[:k].unsqueeze(0).expand(input_embeds.shape[0], k, seed_bank.shape[-1])
+    full_embeds = torch.cat([input_embeds, seed_tokens], dim=1)
+    full_mask = extend_attention_mask(attention_mask, k)
+    out = run_backbone_from_embeds(backbone, full_embeds, full_mask)
+    return get_last_hidden_state(out)[:, -1, :]
+
+
+def latent_seed_next_token_logits_from_ids(
+    model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor, num_cot_tokens: int
+) -> torch.Tensor:
+    latent_hidden = build_latent_seed_hidden(model, input_ids, attention_mask, num_cot_tokens)
+    output_embeddings = get_output_embeddings_module(model)
+    output_dtype = getattr(getattr(output_embeddings, "weight", None), "dtype", latent_hidden.dtype)
+    logits = output_embeddings(latent_hidden.to(dtype=output_dtype))
+    return _sanitize_logits(logits, output_dtype=output_dtype)
+
+
 def residual_next_token_logits_from_ids(
     model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor, num_cot_tokens: int
 ) -> torch.Tensor:
     base_hidden, latent_hidden = build_latent_hidden(model, input_ids, attention_mask, num_cot_tokens)
+    # The latent path does not emit tokens directly; it produces a hidden-state
+    # delta that is projected back onto the base next-token hidden state.
     projected_delta = project_hidden(model, latent_hidden - base_hidden).float()
     mix = torch.sigmoid(model.latent_mix_logit.float()).to(projected_delta.device)
     projected_delta = projected_delta * float(getattr(model, "_latent_delta_scale", 1.0)) * mix
@@ -574,6 +968,7 @@ def residual_next_token_logits_from_ids(
     final_hidden = torch.nan_to_num(base_hidden_fp32 + projected_delta, nan=0.0, posinf=50.0, neginf=-50.0)
     output_embeddings = get_output_embeddings_module(model)
     output_dtype = getattr(getattr(output_embeddings, "weight", None), "dtype", final_hidden.dtype)
+    base_logits = _sanitize_logits(output_embeddings(base_hidden_fp32.to(dtype=output_dtype)), output_dtype=output_dtype)
     latent_logits = _sanitize_logits(output_embeddings(final_hidden.to(dtype=output_dtype)), output_dtype=output_dtype)
     fallback_mask = _should_fallback_to_base(model, latent_logits)
     if bool(fallback_mask.any()):
@@ -585,6 +980,7 @@ def residual_next_token_logits_from_ids(
         fallback_logits = _sanitize_logits(output_embeddings(fallback_hidden), output_dtype=output_dtype)
         latent_logits = latent_logits.clone()
         latent_logits[fallback_mask] = fallback_logits
+    _debug_print_vocab_comparison(model, base_logits, latent_logits, fallback_mask=fallback_mask)
     return latent_logits
 
 
@@ -661,6 +1057,125 @@ def sample_latent_completion(
             temperature=float(temperature),
             top_p=float(top_p),
             top_k=int(top_k),
+        )
+        generated = torch.cat([generated, next_id], dim=1)
+        mask = extend_attention_mask(mask, 1)
+        if eos is not None and bool((next_id == int(eos)).all()):
+            break
+    return generated[:, prompt_ids.shape[1] :]
+
+
+@torch.no_grad()
+def sample_recurrent_hidden_completion(
+    model: nn.Module,
+    tokenizer: Any,
+    prompt_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    *,
+    num_cot_tokens: int,
+    max_new_tokens: int,
+    do_sample: bool = False,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
+    repetition_penalty: float = 1.0,
+) -> torch.Tensor:
+    generated = prompt_ids
+    mask = attention_mask
+    eos = tokenizer.eos_token_id
+    for _ in range(max(1, int(max_new_tokens))):
+        logits = recurrent_hidden_next_token_logits_from_ids(model, generated, mask, num_cot_tokens)
+        logits = _apply_repetition_penalty(logits, generated, float(repetition_penalty))
+        next_id = _sample_from_latent_logits(
+            logits.float(),
+            do_sample=bool(do_sample),
+            temperature=float(temperature),
+            top_p=float(top_p),
+            top_k=int(top_k),
+        )
+        generated = torch.cat([generated, next_id], dim=1)
+        mask = extend_attention_mask(mask, 1)
+        if eos is not None and bool((next_id == int(eos)).all()):
+            break
+    return generated[:, prompt_ids.shape[1] :]
+
+
+@torch.no_grad()
+def sample_latent_seed_completion(
+    model: nn.Module,
+    tokenizer: Any,
+    prompt_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    *,
+    num_cot_tokens: int,
+    max_new_tokens: int,
+    do_sample: bool = False,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
+    repetition_penalty: float = 1.0,
+) -> torch.Tensor:
+    """Greedy/temperature sampler for the Option-2 latent-seed architecture.
+
+    At each output step the trainable seeds m_1..m_k are appended to the
+    current real-token prefix and a single backbone forward pass produces the
+    next-token logits. The seeds are not carried across output tokens; they are
+    re-appended each step (they are constant parameters, so this is equivalent
+    to caching them).
+    """
+    generated = prompt_ids
+    mask = attention_mask
+    eos = tokenizer.eos_token_id
+    for _ in range(max(1, int(max_new_tokens))):
+        logits = latent_seed_next_token_logits_from_ids(model, generated, mask, num_cot_tokens)
+        logits = _apply_repetition_penalty(logits, generated, float(repetition_penalty))
+        next_id = _sample_from_latent_logits(
+            logits.float(),
+            do_sample=bool(do_sample),
+            temperature=float(temperature),
+            top_p=float(top_p),
+            top_k=int(top_k),
+        )
+        generated = torch.cat([generated, next_id], dim=1)
+        mask = extend_attention_mask(mask, 1)
+        if eos is not None and bool((next_id == int(eos)).all()):
+            break
+    return generated[:, prompt_ids.shape[1] :]
+
+
+@torch.no_grad()
+def sample_fixed_slot_completion(
+    model: nn.Module,
+    tokenizer: Any,
+    prompt_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    *,
+    num_cot_tokens: int,
+    max_new_tokens: int,
+    do_sample: bool = False,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
+    repetition_penalty: float = 1.0,
+) -> torch.Tensor:
+    generated = prompt_ids
+    mask = attention_mask
+    eos = tokenizer.eos_token_id
+    for _ in range(max(1, int(max_new_tokens))):
+        logits = fixed_slot_next_token_logits_from_ids(model, generated, mask, num_cot_tokens)
+        logits = _apply_repetition_penalty(logits, generated, float(repetition_penalty))
+        next_id = _sample_from_latent_logits(
+            logits,
+            do_sample=bool(do_sample),
+            temperature=float(temperature),
+            top_p=float(top_p),
+            top_k=int(top_k),
+        )
+        _maybe_print_fixed_slot_decode_debug(
+            model,
+            tokenizer,
+            next_id,
+            step_idx=int(generated.shape[1] - prompt_ids.shape[1]),
         )
         generated = torch.cat([generated, next_id], dim=1)
         mask = extend_attention_mask(mask, 1)
@@ -824,15 +1339,47 @@ def run_eval(
             enc = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
             prompt_ids = enc["input_ids"].to(device)
             attn = enc["attention_mask"].to(device)
-            completion_ids = sample_latent_completion(
-                model,
-                tokenizer,
-                prompt_ids,
-                attn,
-                num_cot_tokens=args.num_cot_tokens,
-                max_new_tokens=args.max_completion_length,
-                do_sample=False,
-            )
+            latent_mode_eval = str(getattr(args, "latent_mode", "residual")).strip().lower()
+            if latent_mode_eval == "recurrent_hidden":
+                completion_ids = sample_recurrent_hidden_completion(
+                    model,
+                    tokenizer,
+                    prompt_ids,
+                    attn,
+                    num_cot_tokens=args.num_cot_tokens,
+                    max_new_tokens=args.max_completion_length,
+                    do_sample=False,
+                )
+            elif latent_mode_eval == "fixed_slots":
+                completion_ids = sample_fixed_slot_completion(
+                    model,
+                    tokenizer,
+                    prompt_ids,
+                    attn,
+                    num_cot_tokens=args.num_cot_tokens,
+                    max_new_tokens=args.max_completion_length,
+                    do_sample=False,
+                )
+            elif latent_mode_eval == "latent_seeds":
+                completion_ids = sample_latent_seed_completion(
+                    model,
+                    tokenizer,
+                    prompt_ids,
+                    attn,
+                    num_cot_tokens=args.num_cot_tokens,
+                    max_new_tokens=args.max_completion_length,
+                    do_sample=False,
+                )
+            else:
+                completion_ids = sample_latent_completion(
+                    model,
+                    tokenizer,
+                    prompt_ids,
+                    attn,
+                    num_cot_tokens=args.num_cot_tokens,
+                    max_new_tokens=args.max_completion_length,
+                    do_sample=False,
+                )
             pred_text = tokenizer.decode(completion_ids[0], skip_special_tokens=True).strip()
             info = score_prediction_text(
                 text=pred_text,
@@ -1122,6 +1669,19 @@ def parse_args() -> Args:
     p.add_argument("--gpu_id", type=int, default=0)
     p.add_argument("--stage_i", type=int, default=1)
     p.add_argument("--num_cot_tokens", type=int, default=1)
+    p.add_argument(
+        "--latent_mode",
+        type=str,
+        default="residual",
+        choices=["residual", "fixed_slots", "recurrent_hidden", "latent_seeds"],
+        help="Which latent-COT architecture to use during eval sampling. Training uses the standard HF forward regardless.",
+    )
+    p.add_argument(
+        "--max_latent_seeds",
+        type=int,
+        default=8,
+        help="For --latent_mode latent_seeds: size of the trainable seed bank (num_cot_tokens per stage must be <=).",
+    )
     p.add_argument("--total_empties_hint", type=int, default=10)
     p.add_argument("--per_device_train_batch_size", type=int, default=4)
     p.add_argument("--gradient_accumulation_steps", type=int, default=4)
@@ -1266,6 +1826,7 @@ def main() -> None:
             print(f"No latent_cot_state.pt under {init_ad}; residual projector kept at random init.", flush=True)
     else:
         print("Residual projector + special_thought_embed: random init (latent structure attached).", flush=True)
+    model._latent_debug_tokenizer = tokenizer
     if world_size <= 1:
         model.to(device)
     model.train()

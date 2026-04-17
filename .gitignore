@@ -14,3 +14,9 @@ wandb/
 **/.wandb/
 **/wandb/
 **/wandb_runtime/
+
+.venv/
+.hf_cache/
+addition_runs/
+tmp_latent_debug/
+logs/

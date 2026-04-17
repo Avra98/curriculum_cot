@@ -302,6 +302,7 @@ def run_eval(args: Args, rows: List[Dict[str, Any]], model: torch.nn.Module, tok
         solved = make_solved_grid_from_row(row)
         row_all_exact = True
         row_has_eval_cell = False
+        row_debug_lines: List[str] = []
         for ex in build_cell_examples_from_row(row):
             target_values = stage_i_consistent_values(ex.grid, target_cell=ex.target_cell, stage_i=args.stage_i)
             if not target_size_allowed(len(target_values), int(args.eval_target_size_min), int(args.eval_target_size_max)):
@@ -352,14 +353,17 @@ def run_eval(args: Args, rows: List[Dict[str, Any]], model: torch.nn.Module, tok
             if float(info["exact_set_match"]) < 0.5:
                 row_all_exact = False
             if printed < int(args.debug_print_limit):
-                rr, cc = ex.target_cell
-                print(f"[baseline sft eval debug] target=({rr+1},{cc+1}) output={pred_text!r}", flush=True)
-                print(
-                    f"[baseline sft eval debug] target_values={info['target_values']} predicted_values={info['predicted_values']}",
-                    flush=True,
+                row_debug_lines.append(
+                    f"[baseline sft eval debug] true_values={info['target_values']} "
+                    f"predicted_values={info['predicted_values']} output={pred_text!r}"
                 )
-                printed += 1
         if row_has_eval_cell:
+            if printed < int(args.debug_print_limit) and row_debug_lines:
+                print("[baseline sft eval debug] puzzle_outputs_begin", flush=True)
+                for line in row_debug_lines:
+                    print(line, flush=True)
+                print("[baseline sft eval debug] puzzle_outputs_end", flush=True)
+                printed += 1
             solve_ok += int(row_all_exact)
             solve_rows += 1
     out = {
