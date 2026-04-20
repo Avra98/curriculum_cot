@@ -1887,6 +1887,13 @@ def main() -> None:
         "bf16": (pick_dtype() == torch.bfloat16),
         "report_to": (["wandb"] if args.use_wandb and is_main_process else []),
         "remove_unused_columns": False,
+        # Custom eval runs only on rank 0 (latent decode is heavy), while
+        # ranks 1..N-1 wait inside torch.distributed.broadcast for the
+        # stop signal. With the NCCL watchdog default of 1800s, anything
+        # slower than 30 min triggers a fatal collective timeout. We
+        # extend it generously so deeper-stage evals (k>=2 latent steps)
+        # cannot deadlock the run.
+        "ddp_timeout": 7200,
     }
     if int(args.max_steps) > 0:
         config_kwargs["max_steps"] = int(args.max_steps)

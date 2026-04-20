@@ -42,6 +42,12 @@ TAG_SUFFIX="latent_recurrent"
 TRAIN_PUZZLES="${TRAIN_PUZZLES:-10000}"
 EVAL_PUZZLES="${EVAL_PUZZLES:-100}"
 VALUE_TARGET="${VALUE_TARGET:-0.98}"
+# Per-phase early-stop bars. Default behavior preserved: both phases use
+# VALUE_TARGET unless explicitly overridden. Recommended: SFT_VALUE_TARGET=0.95
+# (let SFT do bulk learning quickly) and GRPO_VALUE_TARGET=0.98 (let GRPO push
+# the last few percent of value precision/recall).
+SFT_VALUE_TARGET="${SFT_VALUE_TARGET:-${VALUE_TARGET}}"
+GRPO_VALUE_TARGET="${GRPO_VALUE_TARGET:-${VALUE_TARGET}}"
 MIN_STEPS_BEFORE_STOP="${MIN_STEPS_BEFORE_STOP:-50}"
 SFT_MAX_STEPS="${SFT_MAX_STEPS:-10000000}"
 GRPO_MAX_STEPS="${GRPO_MAX_STEPS:-10000000}"
@@ -62,6 +68,19 @@ CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${ROOT}/final_checkpoint/hard_9x9_20empty_la
 OUTPUT_ROOT="${OUTPUT_ROOT:-${CHECKPOINT_ROOT}/${RUN_TAG}}"
 STAGE1_INIT_ADAPTER_DIR="${STAGE1_INIT_ADAPTER_DIR:-}"
 STAGE1_SFT_ADAPTER_DIR="${STAGE1_SFT_ADAPTER_DIR:-}"
+# When set, skip both Stage-1 SFT and Stage-1 GRPO and use this adapter
+# directly as the init for Stage-2 SFT. Useful for resuming after a Stage-1
+# GRPO post-training eval hangs but the LoRA adapter is already on disk.
+STAGE1_GRPO_ADAPTER_DIR="${STAGE1_GRPO_ADAPTER_DIR:-}"
+STAGE2_SFT_ADAPTER_DIR="${STAGE2_SFT_ADAPTER_DIR:-}"
+STAGE2_GRPO_ADAPTER_DIR="${STAGE2_GRPO_ADAPTER_DIR:-}"
+# When set, skip Stage-3 SFT and use this adapter directly as the init for
+# Stage-3 GRPO. Useful when SFT plateaus mid-training and we want GRPO to push
+# the last few percentage points without burning more SFT compute.
+STAGE3_SFT_ADAPTER_DIR="${STAGE3_SFT_ADAPTER_DIR:-}"
+# KL anchor for GRPO. Setting > 0 keeps the policy close to the SFT reference
+# and prevents singleton/mode collapse seen in Stage-2 GRPO. 0.0 = no KL.
+GRPO_BETA="${GRPO_BETA:-0.0}"
 
 train_jsonl="${ROOT}/data/sudoku_t3_${EMPTIES}empty_value_qwen_text_stage1_train.jsonl"
 eval_jsonl="${ROOT}/data/sudoku_t3_${EMPTIES}empty_value_qwen_text_stage1_eval.jsonl"
@@ -131,7 +150,7 @@ run_latent_sft() {
     ms2=0
   fi
   mkdir -p "${out_dir}"
-  printf '\n=== Latent(recurrent) stage %s SFT -> stop value prec+recall >= %s (cot=%s) ===\n' "${stage}" "${VALUE_TARGET}" "${cot}" >&2
+  printf '\n=== Latent(recurrent) stage %s SFT -> stop value prec+recall >= %s (cot=%s) ===\n' "${stage}" "${SFT_VALUE_TARGET}" "${cot}" >&2
   printf 'init=%s\nout=%s num_cot_tokens=%s mixed_s1/s2=%s/%s\n' "${init_adapter}" "${out_dir}" "${cot}" "${ms1}" "${ms2}" >&2
   "${PYTHON_BIN}" -m torch.distributed.run --standalone --nproc_per_node "${NUM_PROCESSES}" "${SFT_SCRIPT}" \
     --model_name "${MODEL_NAME}" \
@@ -160,8 +179,8 @@ run_latent_sft() {
     --eval_rows "${EVAL_PUZZLES}" \
     --max_completion_length 24 \
     --limit_train_rows "${TRAIN_PUZZLES}" \
-    --eval_value_precision_stop "${VALUE_TARGET}" \
-    --eval_value_recall_stop "${VALUE_TARGET}" \
+    --eval_value_precision_stop "${SFT_VALUE_TARGET}" \
+    --eval_value_recall_stop "${SFT_VALUE_TARGET}" \
     --eval_exact_set_match_stop 0 \
     --eval_solve_rate_stop 0 \
     --min_steps_before_stop "${MIN_STEPS_BEFORE_STOP}" \
@@ -177,7 +196,7 @@ run_latent_sft() {
     --lora_dropout "${LORA_DROPOUT}" \
     --use_wandb \
     --wandb_project "sudoku-latent-multi-output-sft-recurrent" \
-    --wandb_run_name "latent20_st${stage}_sft_i${stage}_${TAG_SUFFIX}_cot${cot}_val${VALUE_TARGET}_${RUN_TAG}" \
+    --wandb_run_name "latent20_st${stage}_sft_i${stage}_${TAG_SUFFIX}_cot${cot}_val${SFT_VALUE_TARGET}_${RUN_TAG}" \
     --wandb_mode "${WANDB_MODE}" \
     --wandb_entity "${WANDB_ENTITY}"
 }
@@ -188,7 +207,7 @@ run_latent_grpo() {
   local out_dir="$3"
   local cot="$4"
   mkdir -p "${out_dir}"
-  printf '\n=== Latent(recurrent) stage %s GRPO -> stop value prec+recall >= %s (cot=%s) ===\n' "${stage}" "${VALUE_TARGET}" "${cot}" >&2
+  printf '\n=== Latent(recurrent) stage %s GRPO -> stop value prec+recall >= %s (cot=%s) ===\n' "${stage}" "${GRPO_VALUE_TARGET}" "${cot}" >&2
   printf 'init=%s\nout=%s num_cot_tokens=%s\n' "${init_adapter}" "${out_dir}" "${cot}" >&2
   "${PYTHON_BIN}" -m torch.distributed.run --standalone --nproc_per_node "${NUM_PROCESSES}" "${GRPO_SCRIPT}" \
     --model_name "${MODEL_NAME}" \
@@ -216,7 +235,7 @@ run_latent_grpo() {
     --num_generations 4 \
     --max_prompt_length 1024 \
     --max_completion_length 24 \
-    --beta 0.0 \
+    --beta "${GRPO_BETA}" \
     --enable_gradient_checkpointing \
     --limit_train_rows "${TRAIN_PUZZLES}" \
     --reward_good_value 1.25 \
@@ -224,8 +243,8 @@ run_latent_grpo() {
     --penalty_malformed 4.0 \
     --penalty_empty 0.5 \
     --penalty_singleton 1.5 \
-    --eval_value_precision_stop "${VALUE_TARGET}" \
-    --eval_value_recall_stop "${VALUE_TARGET}" \
+    --eval_value_precision_stop "${GRPO_VALUE_TARGET}" \
+    --eval_value_recall_stop "${GRPO_VALUE_TARGET}" \
     --eval_solve_rate_stop 0 \
     --min_steps_before_stop "${MIN_STEPS_BEFORE_STOP}" \
     --max_wall_clock_seconds "${PHASE_WALL_CLOCK_SECONDS}" \
@@ -235,21 +254,26 @@ run_latent_grpo() {
     --lora_dropout "${LORA_DROPOUT}" \
     --use_wandb \
     --wandb_project "sudoku-latent-multi-output-grpo-recurrent" \
-    --wandb_run_name "latent20_st${stage}_grpo_i${stage}_${TAG_SUFFIX}_cot${cot}_val${VALUE_TARGET}_${RUN_TAG}" \
+    --wandb_run_name "latent20_st${stage}_grpo_i${stage}_${TAG_SUFFIX}_cot${cot}_val${GRPO_VALUE_TARGET}_${RUN_TAG}" \
     --wandb_mode "${WANDB_MODE}" \
     --wandb_entity "${WANDB_ENTITY}"
 }
 
 printf 'Pipeline root: %s\n' "${OUTPUT_ROOT}"
 printf 'Latent mode: %s (cot grows 1->2->3 per stage)\n' "${LATENT_MODE}"
-printf 'Value gate: precision AND recall >= %s (min_steps=%s)\n' "${VALUE_TARGET}" "${MIN_STEPS_BEFORE_STOP}"
+printf 'Value gate: SFT prec+recall >= %s ; GRPO prec+recall >= %s (min_steps=%s) ; GRPO_BETA=%s\n' "${SFT_VALUE_TARGET}" "${GRPO_VALUE_TARGET}" "${MIN_STEPS_BEFORE_STOP}" "${GRPO_BETA}"
 printf 'Stage-1 init adapter: %s\n' "${STAGE1_INIT_ADAPTER_DIR:-<fresh-lora-random-latent>}"
 
 S1_SFT_DIR="${OUTPUT_ROOT}/stage01_sft_i1_${EMPTIES}empty_${TAG_SUFFIX}"
 G1_DIR="${OUTPUT_ROOT}/stage01_grpo_i1_${EMPTIES}empty_${TAG_SUFFIX}"
-if [[ -n "${STAGE1_SFT_ADAPTER_DIR}" ]]; then
+if [[ -n "${STAGE1_GRPO_ADAPTER_DIR}" ]]; then
+  A1="${STAGE1_GRPO_ADAPTER_DIR}"
+  printf 'Using existing stage-1 GRPO adapter (skipping stage-1 SFT + GRPO): %s\n' "${A1}" >&2
+elif [[ -n "${STAGE1_SFT_ADAPTER_DIR}" ]]; then
   G1_SFT_CKPT="${STAGE1_SFT_ADAPTER_DIR}"
   printf 'Using existing stage-1 SFT checkpoint as GRPO init (skipping stage-1 SFT train): %s\n' "${G1_SFT_CKPT}" >&2
+  run_latent_grpo 1 "${G1_SFT_CKPT}" "${G1_DIR}" 1
+  A1="$(resolve_latent_grpo_adapter "${G1_DIR}")"
 else
   run_latent_sft 1 "${STAGE1_INIT_ADAPTER_DIR}" "${S1_SFT_DIR}" "${STAGE1_SFT_LR}" 1
   G1_SFT_CKPT="$(latest_sft_step_ckpt "${S1_SFT_DIR}")"
@@ -257,9 +281,9 @@ else
     printf 'ERROR: No checkpoint-step-* under %s\n' "${S1_SFT_DIR}" >&2
     exit 1
   fi
+  run_latent_grpo 1 "${G1_SFT_CKPT}" "${G1_DIR}" 1
+  A1="$(resolve_latent_grpo_adapter "${G1_DIR}")"
 fi
-run_latent_grpo 1 "${G1_SFT_CKPT}" "${G1_DIR}" 1
-A1="$(resolve_latent_grpo_adapter "${G1_DIR}")"
 if [[ -z "${A1}" ]]; then
   printf 'ERROR: Could not resolve stage-1 latent GRPO adapter.\n' >&2
   exit 1
@@ -267,28 +291,43 @@ fi
 printf 'Stage-1 latent GRPO adapter for stage-2 SFT init: %s\n' "${A1}"
 
 S2_DIR="${OUTPUT_ROOT}/stage02_sft_i2_${EMPTIES}empty_${TAG_SUFFIX}"
-run_latent_sft 2 "${A1}" "${S2_DIR}" "5e-5" 2
-CKPT_S2="$(latest_sft_step_ckpt "${S2_DIR}")"
-if [[ -z "${CKPT_S2}" ]]; then
-  printf 'ERROR: No checkpoint-step-* under %s\n' "${S2_DIR}" >&2
-  exit 1
-fi
 G2_DIR="${OUTPUT_ROOT}/stage02_grpo_i2_${EMPTIES}empty_${TAG_SUFFIX}"
-run_latent_grpo 2 "${CKPT_S2}" "${G2_DIR}" 2
-A2="$(resolve_latent_grpo_adapter "${G2_DIR}")"
-if [[ -z "${A2}" ]]; then
+if [[ -n "${STAGE2_GRPO_ADAPTER_DIR}" ]]; then
+  A2="${STAGE2_GRPO_ADAPTER_DIR}"
+  printf 'Using existing stage-2 GRPO adapter (skipping stage-2 SFT + GRPO): %s\n' "${A2}" >&2
+elif [[ -n "${STAGE2_SFT_ADAPTER_DIR}" ]]; then
+  CKPT_S2="${STAGE2_SFT_ADAPTER_DIR}"
+  printf 'Using existing stage-2 SFT checkpoint as GRPO init (skipping stage-2 SFT train): %s\n' "${CKPT_S2}" >&2
+  run_latent_grpo 2 "${CKPT_S2}" "${G2_DIR}" 2
+  A2="$(resolve_latent_grpo_adapter "${G2_DIR}")"
+else
+  run_latent_sft 2 "${A1}" "${S2_DIR}" "5e-5" 2
+  CKPT_S2="$(latest_sft_step_ckpt "${S2_DIR}")"
+  if [[ -z "${CKPT_S2}" ]]; then
+    printf 'ERROR: No checkpoint-step-* under %s\n' "${S2_DIR}" >&2
+    exit 1
+  fi
+  run_latent_grpo 2 "${CKPT_S2}" "${G2_DIR}" 2
+  A2="$(resolve_latent_grpo_adapter "${G2_DIR}")"
+fi
+ if [[ -z "${A2}" ]]; then
   printf 'ERROR: Could not resolve stage-2 latent GRPO adapter under %s\n' "${G2_DIR}" >&2
   exit 1
 fi
 
 S3_DIR="${OUTPUT_ROOT}/stage03_sft_i3_${EMPTIES}empty_${TAG_SUFFIX}"
-run_latent_sft 3 "${A2}" "${S3_DIR}" "5e-5" 3
-CKPT_S3="$(latest_sft_step_ckpt "${S3_DIR}")"
-if [[ -z "${CKPT_S3}" ]]; then
-  printf 'ERROR: No checkpoint-step-* under %s\n' "${S3_DIR}" >&2
-  exit 1
-fi
 G3_DIR="${OUTPUT_ROOT}/stage03_grpo_i3_${EMPTIES}empty_${TAG_SUFFIX}"
+if [[ -n "${STAGE3_SFT_ADAPTER_DIR}" ]]; then
+  CKPT_S3="${STAGE3_SFT_ADAPTER_DIR}"
+  printf 'Using existing stage-3 SFT checkpoint as GRPO init (skipping stage-3 SFT train): %s\n' "${CKPT_S3}" >&2
+else
+  run_latent_sft 3 "${A2}" "${S3_DIR}" "5e-5" 3
+  CKPT_S3="$(latest_sft_step_ckpt "${S3_DIR}")"
+  if [[ -z "${CKPT_S3}" ]]; then
+    printf 'ERROR: No checkpoint-step-* under %s\n' "${S3_DIR}" >&2
+    exit 1
+  fi
+fi
 run_latent_grpo 3 "${CKPT_S3}" "${G3_DIR}" 3
 A3="$(resolve_latent_grpo_adapter "${G3_DIR}")"
 if [[ -z "${A3}" ]]; then
