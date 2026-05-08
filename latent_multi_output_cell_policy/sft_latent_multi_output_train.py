@@ -625,8 +625,18 @@ def parse_args() -> Args:
     p.add_argument("--eval_steps", type=int, default=100)
     p.add_argument("--eval_rows", type=int, default=20)
     p.add_argument("--max_completion_length", type=int, default=24)
-    p.add_argument("--lora_r", type=int, default=16)
-    p.add_argument("--lora_alpha", type=int, default=32)
+    p.add_argument(
+        "--lora_r",
+        type=int,
+        default=16,
+        help="LoRA rank. Use -1 to resolve to model hidden_size, i.e. full-rank adapters for hidden-width projections.",
+    )
+    p.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=32,
+        help="LoRA alpha. Use -1 to resolve to 2 * resolved_lora_r.",
+    )
     p.add_argument("--lora_dropout", type=float, default=0.05)
     p.add_argument("--use_wandb", action="store_true")
     p.add_argument("--wandb_entity", type=str, default="")

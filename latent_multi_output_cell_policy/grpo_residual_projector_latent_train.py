@@ -143,6 +143,28 @@ def ensure_trl_fsdp_compat() -> None:
         pass
 
 
+def resolve_lora_hparams(base_model: torch.nn.Module, *, lora_r: int, lora_alpha: int) -> tuple[int, int]:
+    """Resolve sentinel LoRA hyperparameters.
+
+    ``lora_r <= 0`` means "full-rank for hidden-width projections", implemented
+    as ``config.hidden_size``. This is not full model fine-tuning, but it makes
+    the LoRA update full-rank for the main hidden-width target matrices.
+
+    ``lora_alpha <= 0`` tracks the usual local convention ``alpha = 2 * r``.
+    """
+    resolved_r = int(lora_r)
+    if resolved_r <= 0:
+        config = getattr(base_model, "config", None)
+        hidden_size = int(getattr(config, "hidden_size", 0) or getattr(config, "n_embd", 0) or 0)
+        if hidden_size <= 0:
+            raise ValueError("Cannot resolve full-rank LoRA: model config has no hidden_size/n_embd.")
+        resolved_r = hidden_size
+    resolved_alpha = int(lora_alpha)
+    if resolved_alpha <= 0:
+        resolved_alpha = 2 * resolved_r
+    return resolved_r, resolved_alpha
+
+
 def load_trainable_adapter(
     base_model: torch.nn.Module,
     adapter_dir: str,
@@ -152,9 +174,14 @@ def load_trainable_adapter(
     lora_dropout: float = 0.05,
 ) -> torch.nn.Module:
     if not str(adapter_dir).strip():
-        lora = LoraConfig(
-            r=int(lora_r),
+        resolved_r, resolved_alpha = resolve_lora_hparams(
+            base_model,
+            lora_r=int(lora_r),
             lora_alpha=int(lora_alpha),
+        )
+        lora = LoraConfig(
+            r=resolved_r,
+            lora_alpha=resolved_alpha,
             lora_dropout=float(lora_dropout),
             bias="none",
             task_type="CAUSAL_LM",
@@ -1189,11 +1216,13 @@ def install_latent_grpo_model_interface(
     tokenizer: Any,
     *,
     num_cot_tokens: int,
+    latent_mode: str = "residual",
     latent_delta_scale: float = 1.0,
     latent_delta_max_ratio: float = 0.5,
 ) -> nn.Module:
     if getattr(model, "_latent_grpo_interface_installed", False):
         model._latent_grpo_num_cot_tokens = int(num_cot_tokens)
+        model._latent_grpo_latent_mode = str(latent_mode).strip().lower()
         model._latent_grpo_tokenizer = tokenizer
         model._latent_delta_scale = float(latent_delta_scale)
         model._latent_delta_max_ratio = float(latent_delta_max_ratio)
@@ -1201,11 +1230,23 @@ def install_latent_grpo_model_interface(
 
     model._latent_grpo_interface_installed = True
     model._latent_grpo_num_cot_tokens = int(num_cot_tokens)
+    model._latent_grpo_latent_mode = str(latent_mode).strip().lower()
     model._latent_grpo_tokenizer = tokenizer
     model._latent_delta_scale = float(latent_delta_scale)
     model._latent_delta_max_ratio = float(latent_delta_max_ratio)
     model._latent_original_forward = model.forward
     model._latent_original_generate = model.generate
+
+    def next_token_logits_for_mode(self, prefix_ids: torch.Tensor, prefix_mask: torch.Tensor) -> torch.Tensor:
+        mode = str(getattr(self, "_latent_grpo_latent_mode", "residual")).strip().lower()
+        k = int(getattr(self, "_latent_grpo_num_cot_tokens", 0))
+        if mode == "fixed_slots":
+            return fixed_slot_next_token_logits_from_ids(self, prefix_ids, prefix_mask, k)
+        if mode == "recurrent_hidden":
+            return recurrent_hidden_next_token_logits_from_ids(self, prefix_ids, prefix_mask, k)
+        if mode == "latent_seeds":
+            return latent_seed_next_token_logits_from_ids(self, prefix_ids, prefix_mask, k)
+        return residual_next_token_logits_from_ids(self, prefix_ids, prefix_mask, k)
 
     def latent_forward(
         self,
@@ -1230,12 +1271,7 @@ def install_latent_grpo_model_interface(
         for prefix_len in range(start, seq_len + 1):
             prefix_ids = input_ids[:, :prefix_len]
             prefix_mask = attention_mask[:, :prefix_len]
-            step_logits = residual_next_token_logits_from_ids(
-                self,
-                prefix_ids,
-                prefix_mask,
-                int(self._latent_grpo_num_cot_tokens),
-            )
+            step_logits = next_token_logits_for_mode(self, prefix_ids, prefix_mask)
             logits.append(step_logits.unsqueeze(1))
         return CausalLMOutput(logits=torch.cat(logits, dim=1))
 
@@ -1268,19 +1304,24 @@ def install_latent_grpo_model_interface(
         for row_ids, row_mask in zip(input_ids, attention_mask, strict=True):
             row_prompt = row_ids.unsqueeze(0)
             row_attn = row_mask.unsqueeze(0)
-            completion = sample_latent_completion(
-                self,
-                tokenizer_local,
-                row_prompt,
-                row_attn,
-                num_cot_tokens=int(self._latent_grpo_num_cot_tokens),
-                max_new_tokens=max_new_tokens,
-                do_sample=do_sample,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                repetition_penalty=repetition_penalty,
-            )
+            mode = str(getattr(self, "_latent_grpo_latent_mode", "residual")).strip().lower()
+            sample_kwargs = {
+                "num_cot_tokens": int(self._latent_grpo_num_cot_tokens),
+                "max_new_tokens": max_new_tokens,
+                "do_sample": do_sample,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "repetition_penalty": repetition_penalty,
+            }
+            if mode == "fixed_slots":
+                completion = sample_fixed_slot_completion(self, tokenizer_local, row_prompt, row_attn, **sample_kwargs)
+            elif mode == "recurrent_hidden":
+                completion = sample_recurrent_hidden_completion(self, tokenizer_local, row_prompt, row_attn, **sample_kwargs)
+            elif mode == "latent_seeds":
+                completion = sample_latent_seed_completion(self, tokenizer_local, row_prompt, row_attn, **sample_kwargs)
+            else:
+                completion = sample_latent_completion(self, tokenizer_local, row_prompt, row_attn, **sample_kwargs)
             rows.append(torch.cat([row_prompt, completion], dim=1).squeeze(0))
 
         max_len = max(int(row.shape[0]) for row in rows)
@@ -1584,8 +1625,9 @@ class ResidualProjectorEvalCallback(TrainerCallback):
 
 
 class SaveLatentStateCallback(TrainerCallback):
-    def __init__(self, is_main_process: bool):
+    def __init__(self, is_main_process: bool, extra_save_fn: Any | None = save_latent_projector_state):
         self.is_main_process = is_main_process
+        self.extra_save_fn = extra_save_fn
 
     def on_save(self, args, state, control, **kwargs):
         if not self.is_main_process:
@@ -1594,23 +1636,30 @@ class SaveLatentStateCallback(TrainerCallback):
         if model is None:
             return control
         step_dir = os.path.join(args.output_dir, f"checkpoint-{int(state.global_step)}")
-        if os.path.isdir(step_dir):
-            save_latent_projector_state(unwrap_training_model(model), step_dir)
+        if os.path.isdir(step_dir) and self.extra_save_fn is not None:
+            self.extra_save_fn(unwrap_training_model(model), step_dir)
         return control
 
 
 class FinalCheckpointCallback(TrainerCallback):
-    def __init__(self, output_dir: str, tokenizer: Any, is_main_process: bool):
+    def __init__(
+        self,
+        output_dir: str,
+        tokenizer: Any,
+        is_main_process: bool,
+        extra_save_fn: Any | None = save_latent_projector_state,
+    ):
         self.output_dir = output_dir
         self.tokenizer = tokenizer
         self.is_main_process = is_main_process
+        self.extra_save_fn = extra_save_fn
 
     def _save(self, model: Any) -> None:
         save_model_artifacts(
             unwrap_training_model(model),
             self.tokenizer,
             ensure_final_checkpoint_dir(self.output_dir),
-            extra_save_fn=save_latent_projector_state,
+            extra_save_fn=self.extra_save_fn,
         )
 
     def on_save(self, args, state, control, **kwargs):
@@ -1674,7 +1723,7 @@ def parse_args() -> Args:
         type=str,
         default="residual",
         choices=["residual", "fixed_slots", "recurrent_hidden", "latent_seeds"],
-        help="Which latent-COT architecture to use during eval sampling. Training uses the standard HF forward regardless.",
+        help="Which latent-COT architecture to use for GRPO forward, generation, and eval sampling.",
     )
     p.add_argument(
         "--max_latent_seeds",
@@ -1696,8 +1745,18 @@ def parse_args() -> Args:
     p.add_argument("--max_completion_length", type=int, default=24)
     p.add_argument("--beta", type=float, default=0.0)
     p.add_argument("--enable_gradient_checkpointing", action="store_true")
-    p.add_argument("--lora_r", type=int, default=192)
-    p.add_argument("--lora_alpha", type=int, default=384)
+    p.add_argument(
+        "--lora_r",
+        type=int,
+        default=192,
+        help="LoRA rank. Use -1 to resolve to model hidden_size, i.e. full-rank adapters for hidden-width projections.",
+    )
+    p.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=384,
+        help="LoRA alpha. Use -1 to resolve to 2 * resolved_lora_r.",
+    )
     p.add_argument("--lora_dropout", type=float, default=0.05)
     p.add_argument("--use_wandb", action="store_true")
     p.add_argument("--wandb_entity", type=str, default="")
@@ -1805,28 +1864,59 @@ def main() -> None:
         lora_dropout=float(args.lora_dropout),
     )
     init_ad = str(args.init_adapter_dir).strip()
+    hidden_size = int(unwrap_backbone(model).config.hidden_size)
+    latent_mode = str(args.latent_mode).strip().lower()
+    extra_save_fn: Any | None
     if init_ad:
         print(f"Loaded init adapter: {init_ad}", flush=True)
-        projector_hidden = infer_projector_hidden_from_state(init_ad) or PROJECTOR_HIDDEN
     else:
         print(
             "init_adapter_dir empty: fresh LoRA on base (weights random); matches --lora_r/--lora_alpha/--lora_dropout.",
             flush=True,
         )
-        projector_hidden = PROJECTOR_HIDDEN
-    attach_residual_projector_modules(
-        model,
-        hidden_size=int(unwrap_backbone(model).config.hidden_size),
-        projector_hidden=projector_hidden,
-    )
-    if init_ad:
-        if maybe_load_projector_state(model, init_ad):
+
+    if latent_mode == "fixed_slots":
+        max_latent_slots = max(1, int(args.num_cot_tokens))
+        if init_ad:
+            max_latent_slots = infer_fixed_slot_count_from_state(init_ad) or max_latent_slots
+        attach_fixed_latent_slot_modules(model, hidden_size=hidden_size, max_latent_slots=max_latent_slots)
+        if init_ad and maybe_load_fixed_slot_state(model, init_ad):
+            print(f"Loaded fixed_slot_latent_state.pt from: {init_ad}", flush=True)
+        else:
+            print(f"Fixed latent slots active (max_latent_slots={max_latent_slots}).", flush=True)
+        extra_save_fn = save_fixed_slot_latent_state
+    elif latent_mode == "latent_seeds":
+        max_latent_seeds = max(1, int(args.max_latent_seeds), int(args.num_cot_tokens))
+        if init_ad:
+            max_latent_seeds = infer_latent_seed_count_from_state(init_ad) or max_latent_seeds
+        attach_latent_seed_modules(model, hidden_size=hidden_size, max_latent_seeds=max_latent_seeds)
+        if init_ad and maybe_load_latent_seed_state(model, init_ad):
+            print(f"Loaded latent_seed_state.pt from: {init_ad}", flush=True)
+        else:
+            print(f"Latent seed bank active (max_latent_seeds={max_latent_seeds}).", flush=True)
+        extra_save_fn = save_latent_seed_state
+    elif latent_mode == "recurrent_hidden":
+        print(
+            f"Recurrent hidden latent rollout active (num_cot_tokens={int(args.num_cot_tokens)}); "
+            "no extra latent parameters to save.",
+            flush=True,
+        )
+        extra_save_fn = None
+    else:
+        projector_hidden = infer_projector_hidden_from_state(init_ad) or PROJECTOR_HIDDEN if init_ad else PROJECTOR_HIDDEN
+        attach_residual_projector_modules(model, hidden_size=hidden_size, projector_hidden=projector_hidden)
+        if init_ad and maybe_load_projector_state(model, init_ad):
             print(f"Loaded latent_cot_state.pt from: {init_ad}", flush=True)
         else:
-            print(f"No latent_cot_state.pt under {init_ad}; residual projector kept at random init.", flush=True)
-    else:
-        print("Residual projector + special_thought_embed: random init (latent structure attached).", flush=True)
+            print("Residual projector + special_thought_embed active.", flush=True)
+        extra_save_fn = save_latent_projector_state
     model._latent_debug_tokenizer = tokenizer
+    install_latent_grpo_model_interface(
+        model,
+        tokenizer,
+        num_cot_tokens=int(args.num_cot_tokens),
+        latent_mode=latent_mode,
+    )
     if world_size <= 1:
         model.to(device)
     model.train()
@@ -1917,8 +2007,8 @@ def main() -> None:
             is_main_process,
         )
     )
-    trainer.add_callback(SaveLatentStateCallback(is_main_process))
-    trainer.add_callback(FinalCheckpointCallback(args.output_dir, tokenizer, is_main_process))
+    trainer.add_callback(SaveLatentStateCallback(is_main_process, extra_save_fn=extra_save_fn))
+    trainer.add_callback(FinalCheckpointCallback(args.output_dir, tokenizer, is_main_process, extra_save_fn=extra_save_fn))
     trainer.add_callback(WallClockStopCallback(args.max_wall_clock_seconds))
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint or None)
 
@@ -1945,12 +2035,13 @@ def main() -> None:
             f"stage{si}_solve={eval_metrics[f'stage{si}/solve_rate']:.3f}"
         )
         trainer.save_model(args.output_dir)
-        save_latent_projector_state(final_model, args.output_dir)
+        if extra_save_fn is not None:
+            extra_save_fn(final_model, args.output_dir)
         save_model_artifacts(
             final_model,
             tokenizer,
             ensure_final_checkpoint_dir(args.output_dir),
-            extra_save_fn=save_latent_projector_state,
+            extra_save_fn=extra_save_fn,
         )
         if wb_run is not None:
             wandb.log({f"final_eval/{k}": float(v) for k, v in eval_metrics.items()})
