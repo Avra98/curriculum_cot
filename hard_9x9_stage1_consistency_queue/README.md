@@ -76,3 +76,42 @@ Use the results to decide which one or two methods should be promoted to deeper
 curriculum stages. The expected practical tradeoff is that `fixed_slots` and
 `latent_seeds` should be much faster per wall-clock time, while `residual` and
 `recurrent_hidden` test more iterative, example-dependent latent computation.
+
+## Warm Baseline Stages 1-3 Pipeline
+
+The full warm-baseline launcher is:
+
+```bash
+STAGE1_BASELINE_ADAPTER_DIR=/path/to/warmed/stage1/baseline/checkpoint \
+  bash hard_9x9_stage1_consistency_queue/launch_20empty_warm_baseline_all_latent_modes_stages123.sh
+```
+
+It runs all four latent modes in parallel, two GPUs per mode:
+
+```text
+residual         -> GPUs 0,1
+fixed_slots      -> GPUs 2,3
+recurrent_hidden -> GPUs 4,5
+latent_seeds     -> GPUs 6,7
+```
+
+For each mode, the intended sequence is:
+
+```text
+stage1 latent SFT
+  -> stage1 latent GRPO
+  -> stage2 baseline warm-up SFT
+  -> stage2 latent SFT
+  -> stage2 latent GRPO
+  -> stage3 baseline warm-up SFT
+  -> stage3 latent SFT
+  -> stage3 latent GRPO
+```
+
+The run is capped by fixed step budgets by default (`1000` SFT steps and `500`
+GRPO steps per phase) and can stop early when the configured solve-rate target
+is reached. The current 1.5B run uses the warmed Stage-1 baseline adapter from
+`hard_9x9_20empty_baseline_1p5b_warmup`.
+
+See `warm_baseline_all_latent_modes_stages123_results.md` for the current
+solve-rate snapshot from the ongoing full-pipeline run.
