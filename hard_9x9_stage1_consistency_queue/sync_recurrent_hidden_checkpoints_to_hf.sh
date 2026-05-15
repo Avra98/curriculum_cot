@@ -2,10 +2,10 @@
 # Periodically upload the active recurrent-hidden resume output to Hugging Face.
 #
 # Required:
-#   HF_TOKEN=hf_...
 #   RUN_OUTPUT_DIR=/path/to/recurrent_hidden_resume_stage2sft_...
 #
 # Optional:
+#   HF_TOKEN=hf_...  # otherwise uses `hf auth login` / cached login
 #   HF_REPO_ID=Avra98/sudoku-latent-recurrent-hidden-20empty-stages
 #   HF_REPO_PREFIX=resume_runs/<run_name>
 #   SYNC_INTERVAL_SECONDS=900
@@ -17,11 +17,6 @@ PYTHON_BIN="${PYTHON_BIN:-${ROOT}/.venv/bin/python}"
 HF_REPO_ID="${HF_REPO_ID:-Avra98/sudoku-latent-recurrent-hidden-20empty-stages}"
 RUN_OUTPUT_DIR="${RUN_OUTPUT_DIR:-}"
 SYNC_INTERVAL_SECONDS="${SYNC_INTERVAL_SECONDS:-900}"
-
-if [[ -z "${HF_TOKEN:-}" ]]; then
-  printf 'ERROR: Set HF_TOKEN to a Hugging Face token with write access.\n' >&2
-  exit 1
-fi
 
 if [[ -z "${RUN_OUTPUT_DIR}" ]] || [[ ! -d "${RUN_OUTPUT_DIR}" ]]; then
   printf 'ERROR: Set RUN_OUTPUT_DIR to an existing run output directory.\n' >&2
@@ -40,13 +35,17 @@ upload_once() {
   "${PYTHON_BIN}" - <<'PY'
 import os
 from pathlib import Path
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, get_token
 
 repo_id = os.environ["HF_REPO_ID"]
 folder = Path(os.environ["RUN_OUTPUT_DIR"]).resolve()
 path_in_repo = os.environ["HF_REPO_PREFIX"].strip("/")
 
-api = HfApi(token=os.environ["HF_TOKEN"])
+token = os.environ.get("HF_TOKEN") or get_token()
+if not token:
+    raise SystemExit("No Hugging Face token found. Run `hf auth login` or set HF_TOKEN.")
+
+api = HfApi(token=token)
 api.upload_folder(
     repo_id=repo_id,
     repo_type="model",
