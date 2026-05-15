@@ -19,6 +19,7 @@
 #   STAGE1_LATENT_SFT_ADAPTER_DIR=/path/to/stage01_latent_sft_or_checkpoint
 #   STAGE1_LATENT_GRPO_ADAPTER_DIR=/path/to/stage01_latent_grpo
 #   STAGE2_BASELINE_WARM_ADAPTER_DIR=/path/to/stage02_baseline_warm_sft
+#   STAGE2_LATENT_SFT_INIT_ADAPTER_DIR=/path/to/stage02_latent_sft_checkpoint_to_continue_training
 #   STAGE2_LATENT_SFT_ADAPTER_DIR=/path/to/stage02_latent_sft_or_checkpoint
 #   STAGE2_LATENT_GRPO_ADAPTER_DIR=/path/to/stage02_latent_grpo
 #   STAGE3_BASELINE_WARM_ADAPTER_DIR=/path/to/stage03_baseline_warm_sft
@@ -49,6 +50,7 @@ STAGE1_BASELINE_ADAPTER_DIR="${STAGE1_BASELINE_ADAPTER_DIR:-}"
 STAGE1_LATENT_SFT_ADAPTER_DIR="${STAGE1_LATENT_SFT_ADAPTER_DIR:-}"
 STAGE1_LATENT_GRPO_ADAPTER_DIR="${STAGE1_LATENT_GRPO_ADAPTER_DIR:-}"
 STAGE2_BASELINE_WARM_ADAPTER_DIR="${STAGE2_BASELINE_WARM_ADAPTER_DIR:-}"
+STAGE2_LATENT_SFT_INIT_ADAPTER_DIR="${STAGE2_LATENT_SFT_INIT_ADAPTER_DIR:-}"
 STAGE2_LATENT_SFT_ADAPTER_DIR="${STAGE2_LATENT_SFT_ADAPTER_DIR:-}"
 STAGE2_LATENT_GRPO_ADAPTER_DIR="${STAGE2_LATENT_GRPO_ADAPTER_DIR:-}"
 STAGE3_BASELINE_WARM_ADAPTER_DIR="${STAGE3_BASELINE_WARM_ADAPTER_DIR:-}"
@@ -70,6 +72,7 @@ GRPO_GRAD_ACCUM="${GRPO_GRAD_ACCUM:-2}"
 BASELINE_WARM_MAX_STEPS="${BASELINE_WARM_MAX_STEPS:-1000}"
 LATENT_SFT_MAX_STEPS="${LATENT_SFT_MAX_STEPS:-1000}"
 LATENT_GRPO_MAX_STEPS="${LATENT_GRPO_MAX_STEPS:-500}"
+LATENT_SFT_EVAL_STEPS="${LATENT_SFT_EVAL_STEPS:-250}"
 SFT_NUM_EPOCHS="${SFT_NUM_EPOCHS:-64}"
 GRPO_NUM_TRAIN_EPOCHS="${GRPO_NUM_TRAIN_EPOCHS:-50}"
 
@@ -205,7 +208,7 @@ run_latent_sft() {
     --weight_decay 0.0 \
     --enable_gradient_checkpointing \
     --logging_steps 20 \
-    --eval_steps 250 \
+    --eval_steps "${LATENT_SFT_EVAL_STEPS}" \
     --save_steps 200 \
     --eval_rows "${EVAL_PUZZLES}" \
     --max_completion_length 24 \
@@ -325,7 +328,10 @@ run_mode_pipeline() {
       a_s2_lat="$(latest_checkpoint_or_dir "${STAGE2_LATENT_SFT_ADAPTER_DIR}")"
       printf 'Using existing stage-2 latent SFT adapter for %s: %s\n' "${mode}" "${a_s2_lat}" | tee -a "${log}"
     else
-      if [[ -n "${STAGE2_BASELINE_WARM_ADAPTER_DIR}" ]]; then
+      if [[ -n "${STAGE2_LATENT_SFT_INIT_ADAPTER_DIR}" ]]; then
+        a_b2="$(latest_checkpoint_or_dir "${STAGE2_LATENT_SFT_INIT_ADAPTER_DIR}")"
+        printf 'Continuing stage-2 latent SFT for %s from adapter: %s\n' "${mode}" "${a_b2}" | tee -a "${log}"
+      elif [[ -n "${STAGE2_BASELINE_WARM_ADAPTER_DIR}" ]]; then
         a_b2="$(latest_checkpoint_or_dir "${STAGE2_BASELINE_WARM_ADAPTER_DIR}")"
         printf 'Using existing stage-2 baseline warm adapter for %s: %s\n' "${mode}" "${a_b2}" | tee -a "${log}"
       else
