@@ -30,6 +30,7 @@ fi
 
 RUN_NAME="$(basename "${RUN_OUTPUT_DIR}")"
 HF_REPO_PREFIX="${HF_REPO_PREFIX:-resume_runs/${RUN_NAME}}"
+export HF_REPO_ID RUN_OUTPUT_DIR HF_REPO_PREFIX
 
 upload_once() {
   "${PYTHON_BIN}" - <<'PY'
