@@ -14,6 +14,15 @@
 #   stage1 latent SFT -> stage1 latent GRPO
 #   stage2 baseline SFT warm-up -> stage2 latent SFT -> stage2 latent GRPO
 #   stage3 baseline SFT warm-up -> stage3 latent SFT -> stage3 latent GRPO
+#
+# Optional resume adapters, intended for single-mode resumes:
+#   STAGE1_LATENT_SFT_ADAPTER_DIR=/path/to/stage01_latent_sft_or_checkpoint
+#   STAGE1_LATENT_GRPO_ADAPTER_DIR=/path/to/stage01_latent_grpo
+#   STAGE2_BASELINE_WARM_ADAPTER_DIR=/path/to/stage02_baseline_warm_sft
+#   STAGE2_LATENT_SFT_ADAPTER_DIR=/path/to/stage02_latent_sft_or_checkpoint
+#   STAGE2_LATENT_GRPO_ADAPTER_DIR=/path/to/stage02_latent_grpo
+#   STAGE3_BASELINE_WARM_ADAPTER_DIR=/path/to/stage03_baseline_warm_sft
+#   STAGE3_LATENT_SFT_ADAPTER_DIR=/path/to/stage03_latent_sft_or_checkpoint
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,6 +50,14 @@ if [[ -z "${STAGE1_BASELINE_ADAPTER_DIR}" ]] || [[ ! -d "${STAGE1_BASELINE_ADAPT
   printf 'ERROR: Set STAGE1_BASELINE_ADAPTER_DIR to a finished baseline SFT checkpoint directory.\n' >&2
   exit 1
 fi
+
+STAGE1_LATENT_SFT_ADAPTER_DIR="${STAGE1_LATENT_SFT_ADAPTER_DIR:-}"
+STAGE1_LATENT_GRPO_ADAPTER_DIR="${STAGE1_LATENT_GRPO_ADAPTER_DIR:-}"
+STAGE2_BASELINE_WARM_ADAPTER_DIR="${STAGE2_BASELINE_WARM_ADAPTER_DIR:-}"
+STAGE2_LATENT_SFT_ADAPTER_DIR="${STAGE2_LATENT_SFT_ADAPTER_DIR:-}"
+STAGE2_LATENT_GRPO_ADAPTER_DIR="${STAGE2_LATENT_GRPO_ADAPTER_DIR:-}"
+STAGE3_BASELINE_WARM_ADAPTER_DIR="${STAGE3_BASELINE_WARM_ADAPTER_DIR:-}"
+STAGE3_LATENT_SFT_ADAPTER_DIR="${STAGE3_LATENT_SFT_ADAPTER_DIR:-}"
 
 SFT_PER_DEVICE_BS="${SFT_PER_DEVICE_BS:-8}"
 SFT_GRAD_ACCUM="${SFT_GRAD_ACCUM:-2}"
@@ -279,35 +296,66 @@ run_mode_pipeline() {
 
   local s1_lat="${mode_root}/stage01_latent_sft_i1_${EMPTIES}empty_${tag}"
   local g1="${mode_root}/stage01_latent_grpo_i1_${EMPTIES}empty_${tag}"
-  run_latent_sft "${mode}" 1 1 "${STAGE1_BASELINE_ADAPTER_DIR}" "${s1_lat}" "2e-4" "warmfull_${mode}_st1_latent_sft_${RUN_TAG}" 2>&1 | tee -a "${log}"
-  local a_s1_lat
-  a_s1_lat="$(latest_checkpoint_or_dir "${s1_lat}")"
-  run_latent_grpo "${mode}" 1 1 "${a_s1_lat}" "${g1}" "warmfull_${mode}_st1_latent_grpo_${RUN_TAG}" 2>&1 | tee -a "${log}"
-  local a_g1
-  a_g1="$(latest_checkpoint_or_dir "${g1}")"
+  local a_s1_lat a_g1
+  if [[ -n "${STAGE1_LATENT_GRPO_ADAPTER_DIR}" ]]; then
+    a_g1="$(latest_checkpoint_or_dir "${STAGE1_LATENT_GRPO_ADAPTER_DIR}")"
+    printf 'Using existing stage-1 latent GRPO adapter for %s: %s\n' "${mode}" "${a_g1}" | tee -a "${log}"
+  else
+    if [[ -n "${STAGE1_LATENT_SFT_ADAPTER_DIR}" ]]; then
+      a_s1_lat="$(latest_checkpoint_or_dir "${STAGE1_LATENT_SFT_ADAPTER_DIR}")"
+      printf 'Using existing stage-1 latent SFT adapter for %s: %s\n' "${mode}" "${a_s1_lat}" | tee -a "${log}"
+    else
+      run_latent_sft "${mode}" 1 1 "${STAGE1_BASELINE_ADAPTER_DIR}" "${s1_lat}" "2e-4" "warmfull_${mode}_st1_latent_sft_${RUN_TAG}" 2>&1 | tee -a "${log}"
+      a_s1_lat="$(latest_checkpoint_or_dir "${s1_lat}")"
+    fi
+    run_latent_grpo "${mode}" 1 1 "${a_s1_lat}" "${g1}" "warmfull_${mode}_st1_latent_grpo_${RUN_TAG}" 2>&1 | tee -a "${log}"
+    a_g1="$(latest_checkpoint_or_dir "${g1}")"
+  fi
 
   local b2="${mode_root}/stage02_baseline_warm_sft_i2_${EMPTIES}empty_${tag}"
   local s2_lat="${mode_root}/stage02_latent_sft_i2_${EMPTIES}empty_${tag}"
   local g2="${mode_root}/stage02_latent_grpo_i2_${EMPTIES}empty_${tag}"
-  run_baseline_sft 2 "${a_g1}" "${b2}" "5e-5" "warmfull_${mode}_st2_baseline_warm_sft_${RUN_TAG}" 2>&1 | tee -a "${log}"
-  local a_b2
-  a_b2="$(latest_checkpoint_or_dir "${b2}")"
-  run_latent_sft "${mode}" 2 2 "${a_b2}" "${s2_lat}" "5e-5" "warmfull_${mode}_st2_latent_sft_${RUN_TAG}" 2>&1 | tee -a "${log}"
-  local a_s2_lat
-  a_s2_lat="$(latest_checkpoint_or_dir "${s2_lat}")"
-  run_latent_grpo "${mode}" 2 2 "${a_s2_lat}" "${g2}" "warmfull_${mode}_st2_latent_grpo_${RUN_TAG}" 2>&1 | tee -a "${log}"
-  local a_g2
-  a_g2="$(latest_checkpoint_or_dir "${g2}")"
+  local a_b2 a_s2_lat a_g2
+  if [[ -n "${STAGE2_LATENT_GRPO_ADAPTER_DIR}" ]]; then
+    a_g2="$(latest_checkpoint_or_dir "${STAGE2_LATENT_GRPO_ADAPTER_DIR}")"
+    printf 'Using existing stage-2 latent GRPO adapter for %s: %s\n' "${mode}" "${a_g2}" | tee -a "${log}"
+  else
+    if [[ -n "${STAGE2_LATENT_SFT_ADAPTER_DIR}" ]]; then
+      a_s2_lat="$(latest_checkpoint_or_dir "${STAGE2_LATENT_SFT_ADAPTER_DIR}")"
+      printf 'Using existing stage-2 latent SFT adapter for %s: %s\n' "${mode}" "${a_s2_lat}" | tee -a "${log}"
+    else
+      if [[ -n "${STAGE2_BASELINE_WARM_ADAPTER_DIR}" ]]; then
+        a_b2="$(latest_checkpoint_or_dir "${STAGE2_BASELINE_WARM_ADAPTER_DIR}")"
+        printf 'Using existing stage-2 baseline warm adapter for %s: %s\n' "${mode}" "${a_b2}" | tee -a "${log}"
+      else
+        run_baseline_sft 2 "${a_g1}" "${b2}" "5e-5" "warmfull_${mode}_st2_baseline_warm_sft_${RUN_TAG}" 2>&1 | tee -a "${log}"
+        a_b2="$(latest_checkpoint_or_dir "${b2}")"
+      fi
+      run_latent_sft "${mode}" 2 2 "${a_b2}" "${s2_lat}" "5e-5" "warmfull_${mode}_st2_latent_sft_${RUN_TAG}" 2>&1 | tee -a "${log}"
+      a_s2_lat="$(latest_checkpoint_or_dir "${s2_lat}")"
+    fi
+    run_latent_grpo "${mode}" 2 2 "${a_s2_lat}" "${g2}" "warmfull_${mode}_st2_latent_grpo_${RUN_TAG}" 2>&1 | tee -a "${log}"
+    a_g2="$(latest_checkpoint_or_dir "${g2}")"
+  fi
 
   local b3="${mode_root}/stage03_baseline_warm_sft_i3_${EMPTIES}empty_${tag}"
   local s3_lat="${mode_root}/stage03_latent_sft_i3_${EMPTIES}empty_${tag}"
   local g3="${mode_root}/stage03_latent_grpo_i3_${EMPTIES}empty_${tag}"
-  run_baseline_sft 3 "${a_g2}" "${b3}" "5e-5" "warmfull_${mode}_st3_baseline_warm_sft_${RUN_TAG}" 2>&1 | tee -a "${log}"
-  local a_b3
-  a_b3="$(latest_checkpoint_or_dir "${b3}")"
-  run_latent_sft "${mode}" 3 3 "${a_b3}" "${s3_lat}" "5e-5" "warmfull_${mode}_st3_latent_sft_${RUN_TAG}" 2>&1 | tee -a "${log}"
-  local a_s3_lat
-  a_s3_lat="$(latest_checkpoint_or_dir "${s3_lat}")"
+  local a_b3 a_s3_lat
+  if [[ -n "${STAGE3_LATENT_SFT_ADAPTER_DIR}" ]]; then
+    a_s3_lat="$(latest_checkpoint_or_dir "${STAGE3_LATENT_SFT_ADAPTER_DIR}")"
+    printf 'Using existing stage-3 latent SFT adapter for %s: %s\n' "${mode}" "${a_s3_lat}" | tee -a "${log}"
+  else
+    if [[ -n "${STAGE3_BASELINE_WARM_ADAPTER_DIR}" ]]; then
+      a_b3="$(latest_checkpoint_or_dir "${STAGE3_BASELINE_WARM_ADAPTER_DIR}")"
+      printf 'Using existing stage-3 baseline warm adapter for %s: %s\n' "${mode}" "${a_b3}" | tee -a "${log}"
+    else
+      run_baseline_sft 3 "${a_g2}" "${b3}" "5e-5" "warmfull_${mode}_st3_baseline_warm_sft_${RUN_TAG}" 2>&1 | tee -a "${log}"
+      a_b3="$(latest_checkpoint_or_dir "${b3}")"
+    fi
+    run_latent_sft "${mode}" 3 3 "${a_b3}" "${s3_lat}" "5e-5" "warmfull_${mode}_st3_latent_sft_${RUN_TAG}" 2>&1 | tee -a "${log}"
+    a_s3_lat="$(latest_checkpoint_or_dir "${s3_lat}")"
+  fi
   run_latent_grpo "${mode}" 3 3 "${a_s3_lat}" "${g3}" "warmfull_${mode}_st3_latent_grpo_${RUN_TAG}" 2>&1 | tee -a "${log}"
 
   printf 'Mode %s finished. Output: %s\n' "${mode}" "${mode_root}" | tee -a "${log}"
