@@ -968,9 +968,28 @@ def main() -> None:
                         dist.barrier()
                     should_stop_eval = False
                     if is_main_process:
-                        ev = run_eval(args, eval_rows, model, tokenizer, device)
+                        eval_started_at = time.time()
+                        print(
+                            f"[latent sft eval start step {step:05d}] rows={len(eval_rows)}",
+                            flush=True,
+                        )
                         if wb_run is not None:
-                            wandb.log({f"eval/{k}": float(v) for k, v in ev.items()} | {"step": step})
+                            wandb.log({"eval/in_progress": 1.0, "eval/rows": float(len(eval_rows)), "step": step})
+                        ev = run_eval(args, eval_rows, model, tokenizer, device)
+                        eval_duration = time.time() - eval_started_at
+                        print(
+                            f"[latent sft eval end step {step:05d}] duration_seconds={eval_duration:.1f}",
+                            flush=True,
+                        )
+                        if wb_run is not None:
+                            wandb.log(
+                                {f"eval/{k}": float(v) for k, v in ev.items()}
+                                | {
+                                    "eval/duration_seconds": float(eval_duration),
+                                    "eval/in_progress": 0.0,
+                                    "step": step,
+                                }
+                            )
                         if (
                             args.eval_exact_set_match_stop > 0.0
                             and float(ev["exact_set_match_rate"]) >= args.eval_exact_set_match_stop
